@@ -2,12 +2,18 @@
  * 获取图片的宽高
  */
 export async function getImageDimensions(file: File): Promise<{ width: number; height: number }> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => resolve({ width: img.width, height: img.height })
-    img.onerror = reject
-    img.src = URL.createObjectURL(file)
-  })
+  const url = URL.createObjectURL(file)
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image()
+      el.onload = () => resolve(el)
+      el.onerror = () => reject(new Error('无法读取图片尺寸'))
+      el.src = url
+    })
+    return { width: img.naturalWidth, height: img.naturalHeight }
+  } finally {
+    URL.revokeObjectURL(url)
+  }
 }
 
 /**
@@ -38,12 +44,3 @@ export function calculateExpandedSize(
   }
 }
 
-/**
- * 找到最接近的尺寸选项
- */
-export function closestSizeLabel(width: number, height: number): string {
-  const ratio = width / height
-  if (Math.abs(ratio - 1) < 0.1) return '1:1'
-  if (ratio > 1) return '3:2'
-  return '2:3'
-}

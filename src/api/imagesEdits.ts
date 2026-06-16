@@ -15,6 +15,10 @@ function extractErrorMessage(json: unknown): string | undefined {
   for (const k of ['message', 'error', 'msg', 'detail']) {
     const v = o[k]
     if (typeof v === 'string' && v.length > 0) return v
+    if (v && typeof v === 'object') {
+      const nested = v as Record<string, unknown>
+      if (typeof nested.message === 'string' && nested.message.length > 0) return nested.message
+    }
   }
 }
 

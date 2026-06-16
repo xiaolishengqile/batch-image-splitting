@@ -60,6 +60,9 @@ export const STORAGE_KEY_EXCEL_SHEET = 'batch_image_excel_sheet'
 /** 默认尺寸 */
 export const DEFAULT_SIZE = '1024x1024'
 
+/** API 支持的宽高比标签 */
+export const ASPECT_OPTIONS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9'] as const
+
 /** 尺寸选项 */
 export const SIZE_OPTIONS = [
   '1024x1024',

@@ -15,7 +15,7 @@ import {
   MAX_BATCH_CONCURRENCY,
   MIN_BATCH_CONCURRENCY,
   normalizeBatchConcurrency,
-  PROMPT_OUTPAINT,
+  PROMPT_OUTPAINT_CN,
   STORAGE_KEY_CONCURRENCY,
   PROMPT_VARIATION,
   SIZE_OPTIONS,
@@ -27,7 +27,8 @@ import {
   STORAGE_KEY_VARIATION_COUNT,
 } from './lib/constants'
 import { supportsSaveToFolder, pickSaveDirectoryHandle, writeImageToDirectory } from './lib/files'
-import { getImageDimensions, calculateExpandedSize } from './lib/imageSize'
+import { closestAspectLabel, is2kSizeLabel, sizeForAspect } from './lib/imageAspect'
+import { calculateExpandedSize, getImageDimensions } from './lib/imageSize'
 import './App.css'
 
 type JobStatus = 'queued' | 'running' | 'done' | 'error'
@@ -130,6 +131,7 @@ export default function App() {
   const addedSeqRef = useRef(0)
   const cancelRef = useRef(false)
   const abortRef = useRef<AbortController | null>(null)
+  const runInProgressRef = useRef(false)
 
   // 持久化设置
   useEffect(() => {
@@ -268,6 +270,8 @@ export default function App() {
 
   // 运行批处理 - 分批处理版本（每批 10 个，处理完后从输入列表中移除）
   const runBatch = useCallback(async () => {
+    if (runInProgressRef.current) return
+
     const token = apiToken.trim()
     if (!token) {
       alert('请先填写 API 密钥。')
@@ -279,40 +283,44 @@ export default function App() {
       return
     }
 
+    const normalizedConcurrency = String(normalizeBatchConcurrency(concurrencyInput))
+    setConcurrencyInput(normalizedConcurrency)
+    localStorage.setItem(STORAGE_KEY_CONCURRENCY, normalizedConcurrency)
+
+    // 快照当前输入，避免运行中 state 变化导致重复或遗漏
+    const filesSnapshot = inputFiles
+    const promptsSnapshot = excelPrompts
+    const baseSize = useCustomSize ? customSize : size
+    const use2kOutput = is2kSizeLabel(baseSize)
+
     // 构建任务队列
     type TaskItem = {
       file?: File
-      fileIndex?: number  // 在 inputFiles 中的索引
+      fileIndex?: number
       prompt?: string
-      promptIndex?: number  // 在 excelPrompts 中的索引
+      promptIndex?: number
       jobType: JobType
       variationIndex?: number
     }
 
     const taskQueue: TaskItem[] = []
-    let fileTaskCount = 0  // 图片相关任务的总数（扩充 + 裂变）
 
-    // 功能一：图片扩充
-    if (enableOutpaint && inputFiles.length > 0) {
-      inputFiles.forEach((file, index) => {
+    if (enableOutpaint && filesSnapshot.length > 0) {
+      filesSnapshot.forEach((file, index) => {
         taskQueue.push({ file, fileIndex: index, jobType: 'outpaint' })
-        fileTaskCount++
       })
     }
 
-    // 功能二：图片裂变
-    if (enableVariation && inputFiles.length > 0) {
-      inputFiles.forEach((file, index) => {
+    if (enableVariation && filesSnapshot.length > 0) {
+      filesSnapshot.forEach((file, index) => {
         for (let i = 0; i < variationCount; i++) {
           taskQueue.push({ file, fileIndex: index, jobType: 'variation', variationIndex: i })
-          fileTaskCount++
         }
       })
     }
 
-    // 功能三：文生图
-    if (enableText2Img && excelPrompts.length > 0) {
-      excelPrompts.forEach((p, index) => {
+    if (enableText2Img && promptsSnapshot.length > 0) {
+      promptsSnapshot.forEach((p, index) => {
         taskQueue.push({ prompt: p.prompt, promptIndex: index, jobType: 'text2img' })
       })
     }
@@ -325,46 +333,53 @@ export default function App() {
     const totalTasks = taskQueue.length
     setTotalTaskCount(totalTasks)
     setProcessedTaskCount(0)
-    processedFileIndexRef.current = 0  // 重置已处理文件索引
+    processedFileIndexRef.current = 0
 
+    runInProgressRef.current = true
     cancelRef.current = false
     setIsRunning(true)
 
     let outputSeq = 1
 
-    // 处理单个任务
-    const runOneTask = async (task: TaskItem): Promise<{ outputName: string, resultDataUrl: string } | null> => {
+    const resolveEditParams = async (
+      file: File,
+      jobType: 'outpaint' | 'variation',
+    ): Promise<{ prompt: string; size: string; aspect_ratio: string }> => {
+      const { width, height } = await getImageDimensions(file)
+      if (jobType === 'outpaint') {
+        const expanded = calculateExpandedSize(width, height, parseFloat(expansionScale))
+        const aspect = closestAspectLabel(expanded.width, expanded.height)
+        return {
+          prompt: PROMPT_OUTPAINT_CN,
+          size: sizeForAspect(aspect, baseSize, use2kOutput),
+          aspect_ratio: aspect,
+        }
+      }
+      const aspect = closestAspectLabel(width, height)
+      return {
+        prompt: PROMPT_VARIATION,
+        size: sizeForAspect(aspect, baseSize, use2kOutput),
+        aspect_ratio: aspect,
+      }
+    }
+
+    const runOneTask = async (task: TaskItem): Promise<{ outputName: string; resultDataUrl: string } | null> => {
       if (cancelRef.current) return null
 
       const ac = new AbortController()
       abortRef.current = ac
 
       try {
-        let prompt = ''
-        let targetSize = useCustomSize ? customSize : size
-
-        if (task.jobType === 'outpaint') {
-          prompt = PROMPT_OUTPAINT
-          if (task.file) {
-            const { width, height } = await getImageDimensions(task.file)
-            const expanded = calculateExpandedSize(width, height, parseFloat(expansionScale))
-            targetSize = `${expanded.width}x${expanded.height}`
-          }
-        } else if (task.jobType === 'variation') {
-          prompt = PROMPT_VARIATION
-        } else if (task.jobType === 'text2img') {
-          prompt = task.prompt ?? ''
-        }
-
         let imageDataUrl: string
+
         if (task.jobType === 'text2img') {
           const result = await postImagesGenerations(
             base,
             token,
             {
               model: model.trim() || DEFAULT_MODEL,
-              prompt,
-              size: targetSize,
+              prompt: task.prompt ?? '',
+              size: baseSize,
             },
             ac.signal,
           )
@@ -373,14 +388,15 @@ export default function App() {
           if (!task.file) {
             throw new Error('缺少输入图片')
           }
+          const editParams = await resolveEditParams(task.file, task.jobType)
           const result = await postImagesEdits(
             base,
             token,
             {
               model: model.trim() || DEFAULT_MODEL,
-              prompt,
-              size: targetSize,
-              aspect_ratio: 'auto',
+              prompt: editParams.prompt,
+              size: editParams.size,
+              aspect_ratio: editParams.aspect_ratio,
               images: [task.file],
             },
             ac.signal,
@@ -398,115 +414,93 @@ export default function App() {
       }
     }
 
-    // 按批次处理
     let taskCursor = 0
-    let processedFileCount = 0  // 已处理完的图片数量（用于从 inputFiles 移除）
 
-    while (taskCursor < totalTasks && !cancelRef.current) {
-      const batchStart = taskCursor
-      const batchEnd = Math.min(batchStart + BATCH_WINDOW_SIZE, totalTasks)
-      const batchTasks = taskQueue.slice(batchStart, batchEnd)
-      const currentBatchSize = batchTasks.length
+    try {
+      while (taskCursor < totalTasks && !cancelRef.current) {
+        const batchStart = taskCursor
+        const batchEnd = Math.min(batchStart + BATCH_WINDOW_SIZE, totalTasks)
+        const batchTasks = taskQueue.slice(batchStart, batchEnd)
+        const currentBatchSize = batchTasks.length
 
-      // 为当前批次创建 job 显示
-      const batchJobs: Job[] = batchTasks.map((task) => ({
-        id: crypto.randomUUID(),
-        file: task.file,
-        previewObjectUrl: task.file ? URL.createObjectURL(task.file) : undefined,
-        status: 'queued' as JobStatus,
-        jobType: task.jobType,
-        prompt: task.prompt,
-        addedSeq: addedSeqRef.current++,
-      }))
+        const batchJobs: Job[] = batchTasks.map((task) => ({
+          id: crypto.randomUUID(),
+          file: task.file,
+          previewObjectUrl: task.file ? URL.createObjectURL(task.file) : undefined,
+          status: 'queued' as JobStatus,
+          jobType: task.jobType,
+          prompt: task.prompt,
+          addedSeq: addedSeqRef.current++,
+        }))
 
-      setJobs((prev) => {
-        // 清除上一批次的 jobs，只显示当前批次
-        // 但保留已完成的 jobs 用于历史记录
-        const completedJobs = prev.filter(j => j.status === 'done' || j.status === 'error')
-        return [...completedJobs, ...batchJobs]
-      })
+        setJobs((prev) => {
+          if (batchStart === 0) return batchJobs
+          const finished = prev.filter((j) => j.status === 'done' || j.status === 'error')
+          return [...finished, ...batchJobs]
+        })
 
-      // 并发处理当前批次
-      const concurrency = Math.min(normalizeBatchConcurrency(concurrencyInput), currentBatchSize)
-      let taskIdxInBatch = 0
+        const concurrency = Math.min(normalizeBatchConcurrency(normalizedConcurrency), currentBatchSize)
+        let taskIdxInBatch = 0
 
-      const worker = async () => {
-        while (!cancelRef.current) {
-          const myTask = taskIdxInBatch++
-          if (myTask >= batchTasks.length) return
+        const worker = async () => {
+          while (!cancelRef.current) {
+            const myTask = taskIdxInBatch++
+            if (myTask >= batchTasks.length) return
 
-          const task = batchTasks[myTask]
-          const jobId = batchJobs[myTask].id
+            const task = batchTasks[myTask]
+            const jobId = batchJobs[myTask].id
 
-          // 更新状态为运行中
-          updateJob(jobId, { status: 'running' })
+            updateJob(jobId, { status: 'running' })
 
-          try {
-            const result = await runOneTask(task)
-            if (result) {
-              updateJob(jobId, {
-                status: 'done',
-                resultDataUrl: result.resultDataUrl,
-                completedAt: Date.now(),
-                outputName: result.outputName,
-              })
-              // 自动保存
-              void saveJobToFolder(
-                {
-                  ...batchJobs[myTask],
+            try {
+              const result = await runOneTask(task)
+              if (result) {
+                updateJob(jobId, {
+                  status: 'done',
                   resultDataUrl: result.resultDataUrl,
+                  completedAt: Date.now(),
                   outputName: result.outputName,
-                },
-                autoSaveUsedNamesRef.current
-              )
-            } else {
-              // 被取消，恢复为 queued
-              updateJob(jobId, { status: 'queued' })
-            }
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e)
-            updateJob(jobId, { status: 'error', error: msg })
-          }
-
-          // 更新已处理计数
-          setProcessedTaskCount((prev) => prev + 1)
-
-          // 如果是图片任务，追踪已处理的文件数
-          if (task.fileIndex !== undefined) {
-            processedFileCount++
-            // 当处理完 BATCH_WINDOW_SIZE 个图片任务后，从 inputFiles 移除
-            if (processedFileCount % BATCH_WINDOW_SIZE === 0) {
-              const filesToRemove = Math.floor(processedFileCount / BATCH_WINDOW_SIZE) * BATCH_WINDOW_SIZE
-              if (filesToRemove > processedFileIndexRef.current && filesToRemove <= inputFiles.length) {
-                // 移除已处理的文件
-                setInputFiles((prev) => {
-                  const remaining = prev.slice(filesToRemove - processedFileIndexRef.current)
-                  return remaining
                 })
-                processedFileIndexRef.current = filesToRemove
+                void saveJobToFolder(
+                  {
+                    ...batchJobs[myTask],
+                    resultDataUrl: result.resultDataUrl,
+                    outputName: result.outputName,
+                  },
+                  autoSaveUsedNamesRef.current,
+                )
+              } else {
+                updateJob(jobId, { status: 'queued' })
               }
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e)
+              updateJob(jobId, { status: 'error', error: msg })
             }
+
+            setProcessedTaskCount((prev) => prev + 1)
           }
         }
-      }
 
-      await Promise.all(Array.from({ length: concurrency }, () => worker()))
+        await Promise.all(Array.from({ length: concurrency }, () => worker()))
 
-      // 批次完成后，等待一小延迟再加载下一批
-      if (!cancelRef.current && batchEnd < totalTasks) {
-        await new Promise(resolve => setTimeout(resolve, 300))
+        taskCursor = batchEnd
+
+        if (!cancelRef.current && batchEnd < totalTasks) {
+          await new Promise((resolve) => setTimeout(resolve, 300))
+        }
       }
+    } finally {
+      abortRef.current = null
+      runInProgressRef.current = false
+      setIsRunning(false)
     }
-
-    abortRef.current = null
-    setIsRunning(false)
   }, [
     apiBase,
     apiToken,
     enableOutpaint,
     enableVariation,
     enableText2Img,
-    inputFiles.length,  // 注意：这里只依赖 length，因为我们会在处理中修改 inputFiles
+    inputFiles,
     excelPrompts,
     expansionScale,
     variationCount,
@@ -1051,18 +1045,18 @@ export default function App() {
               </p>
             ) : null}
 
-            {isRunning && jobs.length > 0 ? (
+            {isRunning && totalTaskCount > 0 ? (
               <>
                 <p className="progress-line">
-                  进度：已完成 {jobStats.done} / {jobStats.total}（当前批次）
+                  进度：已完成 {jobStats.done} / {totalTaskCount}
                   {jobStats.running > 0 ? ` · 进行中 ${jobStats.running}` : ''}
                   {jobStats.error > 0 ? ` · 失败 ${jobStats.error}` : ''}
                 </p>
-                {totalTaskCount > BATCH_WINDOW_SIZE && (
+                {totalTaskCount > BATCH_WINDOW_SIZE ? (
                   <p className="progress-line">
-                    总进度：{processedTaskCount} / {totalTaskCount}（共 {Math.ceil(totalTaskCount / BATCH_WINDOW_SIZE)} 批）
+                    已处理 {processedTaskCount} / {totalTaskCount}（共 {Math.ceil(totalTaskCount / BATCH_WINDOW_SIZE)} 批）
                   </p>
-                )}
+                ) : null}
               </>
             ) : null}
           </div>
