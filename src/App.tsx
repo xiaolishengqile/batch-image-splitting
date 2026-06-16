@@ -10,8 +10,13 @@ import {
   DEFAULT_SIZE,
   DEFAULT_VARIATION_COUNT,
   DEFAULT_EXPANSION_SCALE,
+  BATCH_WINDOW_SIZE,
+  DEFAULT_BATCH_CONCURRENCY,
   MAX_BATCH_CONCURRENCY,
+  MIN_BATCH_CONCURRENCY,
+  normalizeBatchConcurrency,
   PROMPT_OUTPAINT,
+  STORAGE_KEY_CONCURRENCY,
   PROMPT_VARIATION,
   SIZE_OPTIONS,
   STORAGE_KEY_BASE,
@@ -21,7 +26,7 @@ import {
   STORAGE_KEY_EXPANSION_SCALE,
   STORAGE_KEY_VARIATION_COUNT,
 } from './lib/constants'
-import { getImageFilesFromDataTransfer } from './lib/files'
+import { supportsSaveToFolder, pickSaveDirectoryHandle, writeImageToDirectory } from './lib/files'
 import { getImageDimensions, calculateExpandedSize } from './lib/imageSize'
 import './App.css'
 
@@ -41,6 +46,9 @@ interface Job {
   prompt?: string
   targetSize?: string
   outputName?: string
+  // 分批处理相关
+  batchIndex?: number  // 当前任务在批次中的索引 (0-9)
+  totalBatches?: number  // 总批次数
 }
 
 interface ExcelPrompt {
@@ -61,11 +69,22 @@ function extensionFromMime(dataUrl: string): string {
 }
 
 export default function App() {
-  // API 设置
-  const [apiBase, setApiBase] = useState(() => localStorage.getItem(STORAGE_KEY_BASE) ?? DEFAULT_API_BASE)
+  // API 设置 - 如果 localStorage 中是 .cn 域名，自动修正为 .org
+  const [apiBase, setApiBase] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEY_BASE)
+    if (saved && saved.includes('ai.t8star.cn')) {
+      // 自动修正为 .org
+      const corrected = saved.replace('ai.t8star.cn', 'ai.t8star.org')
+      localStorage.setItem(STORAGE_KEY_BASE, corrected)
+      return corrected
+    }
+    return saved ?? DEFAULT_API_BASE
+  })
   const [apiToken, setApiToken] = useState(() => localStorage.getItem(STORAGE_KEY_TOKEN) ?? '')
   const [model, setModel] = useState(DEFAULT_MODEL)
   const [size, setSize] = useState(() => localStorage.getItem(STORAGE_KEY_SIZE) ?? DEFAULT_SIZE)
+  const [customSize, setCustomSize] = useState('')
+  const [useCustomSize, setUseCustomSize] = useState(false)
   const [prefix, setPrefix] = useState(() => localStorage.getItem(STORAGE_KEY_PREFIX) ?? 'A')
 
   // 功能设置
@@ -86,11 +105,27 @@ export default function App() {
   const [excelPrompts, setExcelPrompts] = useState<ExcelPrompt[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [isRunning, setIsRunning] = useState(false)
-  const [dragOver, setDragOver] = useState(false)
+  // 批次处理状态
+  const [totalTaskCount, setTotalTaskCount] = useState<number>(0)
+  const [processedTaskCount, setProcessedTaskCount] = useState<number>(0)
+  // 并发数：输入框用字符串，允许清空后重输；失焦或开始处理时再规范化
+  const [concurrencyInput, setConcurrencyInput] = useState(() => {
+    const saved = localStorage.getItem(STORAGE_KEY_CONCURRENCY)
+    if (!saved) return String(DEFAULT_BATCH_CONCURRENCY)
+    return String(normalizeBatchConcurrency(saved))
+  })
+  // 已处理的文件索引（用于从 inputFiles 中移除已处理完的文件）
+  const processedFileIndexRef = useRef<number>(0)
 
   // Excel 相关
   const [excelFile, setExcelFile] = useState<File | null>(null)
   const [excelPreview, setExcelPreview] = useState<string[][]>([])
+
+  // 保存文件夹相关
+  const [saveFolderName, setSaveFolderName] = useState<string | null>(null)
+  const saveFolderHandleRef = useRef<FileSystemDirectoryHandle | null>(null)
+  const [autoSaveAfterGenerate, setAutoSaveAfterGenerate] = useState(false)
+  const autoSaveUsedNamesRef = useRef<Set<string>>(new Set())
 
   const addedSeqRef = useRef(0)
   const cancelRef = useRef(false)
@@ -104,8 +139,8 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY_TOKEN, apiToken)
   }, [apiToken])
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_SIZE, size)
-  }, [size])
+    localStorage.setItem(STORAGE_KEY_SIZE, useCustomSize ? customSize : size)
+  }, [size, customSize, useCustomSize])
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_PREFIX, prefix)
   }, [prefix])
@@ -115,6 +150,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_VARIATION_COUNT, String(variationCount))
   }, [variationCount])
+  const commitConcurrencyInput = useCallback(() => {
+    const normalized = String(normalizeBatchConcurrency(concurrencyInput))
+    setConcurrencyInput(normalized)
+    localStorage.setItem(STORAGE_KEY_CONCURRENCY, normalized)
+  }, [concurrencyInput])
 
   // 清理 URL 对象
   useEffect(() => {
@@ -139,8 +179,8 @@ export default function App() {
       else if (j.status === 'running') running++
       else if (j.status === 'error') error++
     }
-    return { done, running, error, total: jobs.length }
-  }, [jobs])
+    return { done, running, error, total: jobs.length, processed: processedTaskCount, grandTotal: totalTaskCount }
+  }, [jobs, processedTaskCount, totalTaskCount])
 
   const updateJob = useCallback((id: string, patch: Partial<Job>) => {
     setJobs((prev) => prev.map((j) => (j.id === id ? { ...j, ...patch } : j)))
@@ -152,26 +192,6 @@ export default function App() {
     if (arr.length === 0) return
     setInputFiles((prev) => [...prev, ...arr])
   }, [])
-
-  // 拖拽处理
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault()
-      setDragOver(false)
-      if (e.dataTransfer.files?.length) {
-        handleFilesSelected(e.dataTransfer.files)
-      }
-    },
-    [handleFilesSelected],
-  )
-
-  // 粘贴处理
-  const handlePaste = useCallback((e: React.ClipboardEvent) => {
-    const files = getImageFilesFromDataTransfer(e.clipboardData)
-    if (files.length > 0) {
-      handleFilesSelected(files)
-    }
-  }, [handleFilesSelected])
 
   // 移除输入文件
   const removeInputFile = useCallback((index: number) => {
@@ -234,7 +254,19 @@ export default function App() {
     [],
   )
 
-  // 运行批处理
+  // 生成完成后自动保存到文件夹
+  const saveJobToFolder = useCallback(async (job: Job, used: Set<string>) => {
+    if (!autoSaveAfterGenerate || !job.resultDataUrl || !job.outputName) return
+    const dir = saveFolderHandleRef.current
+    if (!dir) return
+    try {
+      await writeImageToDirectory(dir, job.resultDataUrl, `${job.outputName}.${extensionFromMime(job.resultDataUrl)}`, used)
+    } catch (e) {
+      console.error('自动保存失败:', e)
+    }
+  }, [autoSaveAfterGenerate])
+
+  // 运行批处理 - 分批处理版本（每批 10 个，处理完后从输入列表中移除）
   const runBatch = useCallback(async () => {
     const token = apiToken.trim()
     if (!token) {
@@ -247,94 +279,85 @@ export default function App() {
       return
     }
 
-    const allJobs: Job[] = []
+    // 构建任务队列
+    type TaskItem = {
+      file?: File
+      fileIndex?: number  // 在 inputFiles 中的索引
+      prompt?: string
+      promptIndex?: number  // 在 excelPrompts 中的索引
+      jobType: JobType
+      variationIndex?: number
+    }
+
+    const taskQueue: TaskItem[] = []
+    let fileTaskCount = 0  // 图片相关任务的总数（扩充 + 裂变）
 
     // 功能一：图片扩充
     if (enableOutpaint && inputFiles.length > 0) {
-      inputFiles.forEach((file) => {
-        allJobs.push({
-          id: crypto.randomUUID(),
-          file,
-          previewObjectUrl: URL.createObjectURL(file),
-          status: 'queued',
-          jobType: 'outpaint',
-          addedSeq: addedSeqRef.current++,
-        })
+      inputFiles.forEach((file, index) => {
+        taskQueue.push({ file, fileIndex: index, jobType: 'outpaint' })
+        fileTaskCount++
       })
     }
 
     // 功能二：图片裂变
     if (enableVariation && inputFiles.length > 0) {
-      inputFiles.forEach((file) => {
+      inputFiles.forEach((file, index) => {
         for (let i = 0; i < variationCount; i++) {
-          allJobs.push({
-            id: crypto.randomUUID(),
-            file,
-            previewObjectUrl: URL.createObjectURL(file),
-            status: 'queued',
-            jobType: 'variation',
-            addedSeq: addedSeqRef.current++,
-          })
+          taskQueue.push({ file, fileIndex: index, jobType: 'variation', variationIndex: i })
+          fileTaskCount++
         }
       })
     }
 
     // 功能三：文生图
     if (enableText2Img && excelPrompts.length > 0) {
-      excelPrompts.forEach((p) => {
-        allJobs.push({
-          id: crypto.randomUUID(),
-          status: 'queued',
-          jobType: 'text2img',
-          prompt: p.prompt,
-          addedSeq: addedSeqRef.current++,
-        })
+      excelPrompts.forEach((p, index) => {
+        taskQueue.push({ prompt: p.prompt, promptIndex: index, jobType: 'text2img' })
       })
     }
 
-    if (allJobs.length === 0) {
+    if (taskQueue.length === 0) {
       alert('请至少选择一个功能并添加输入内容。')
       return
     }
 
-    setJobs(allJobs)
+    const totalTasks = taskQueue.length
+    setTotalTaskCount(totalTasks)
+    setProcessedTaskCount(0)
+    processedFileIndexRef.current = 0  // 重置已处理文件索引
+
     cancelRef.current = false
     setIsRunning(true)
 
     let outputSeq = 1
 
-    const runOne = async (job: Job) => {
-      if (cancelRef.current) return
-      updateJob(job.id, {
-        status: 'running',
-        error: undefined,
-        resultDataUrl: undefined,
-        completedAt: undefined,
-      })
+    // 处理单个任务
+    const runOneTask = async (task: TaskItem): Promise<{ outputName: string, resultDataUrl: string } | null> => {
+      if (cancelRef.current) return null
+
       const ac = new AbortController()
       abortRef.current = ac
 
       try {
         let prompt = ''
-        let targetSize = size
+        let targetSize = useCustomSize ? customSize : size
 
-        if (job.jobType === 'outpaint') {
+        if (task.jobType === 'outpaint') {
           prompt = PROMPT_OUTPAINT
-          // 计算扩充后的尺寸
-          if (job.file) {
-            const { width, height } = await getImageDimensions(job.file)
+          if (task.file) {
+            const { width, height } = await getImageDimensions(task.file)
             const expanded = calculateExpandedSize(width, height, parseFloat(expansionScale))
             targetSize = `${expanded.width}x${expanded.height}`
           }
-        } else if (job.jobType === 'variation') {
+        } else if (task.jobType === 'variation') {
           prompt = PROMPT_VARIATION
-        } else if (job.jobType === 'text2img') {
-          prompt = job.prompt ?? ''
+        } else if (task.jobType === 'text2img') {
+          prompt = task.prompt ?? ''
         }
 
         let imageDataUrl: string
-        if (job.jobType === 'text2img') {
-          // 文生图使用 generations API
+        if (task.jobType === 'text2img') {
           const result = await postImagesGenerations(
             base,
             token,
@@ -347,8 +370,7 @@ export default function App() {
           )
           imageDataUrl = result.imageDataUrl
         } else {
-          // 图片扩充和裂变使用 edits API
-          if (!job.file) {
+          if (!task.file) {
             throw new Error('缺少输入图片')
           }
           const result = await postImagesEdits(
@@ -359,45 +381,122 @@ export default function App() {
               prompt,
               size: targetSize,
               aspect_ratio: 'auto',
-              images: [job.file],
+              images: [task.file],
             },
             ac.signal,
           )
           imageDataUrl = result.imageDataUrl
         }
 
-        // 生成输出名称
         const outputName = generateOutputName(prefix, outputSeq++)
-        updateJob(job.id, {
-          status: 'done',
-          resultDataUrl: imageDataUrl,
-          completedAt: Date.now(),
-          outputName,
-          targetSize,
-        })
+        return { outputName, resultDataUrl: imageDataUrl }
       } catch (e) {
         if (cancelRef.current || (e instanceof DOMException && e.name === 'AbortError')) {
-          updateJob(job.id, { status: 'queued' })
-          return
+          return null
         }
-        const msg = e instanceof Error ? e.message : String(e)
-        updateJob(job.id, { status: 'error', error: msg })
+        throw e
       }
     }
 
-    const n = Math.min(MAX_BATCH_CONCURRENCY, Math.max(1, allJobs.length))
-    let cursor = 0
+    // 按批次处理
+    let taskCursor = 0
+    let processedFileCount = 0  // 已处理完的图片数量（用于从 inputFiles 移除）
 
-    const worker = async () => {
-      for (;;) {
-        if (cancelRef.current) return
-        const my = cursor++
-        if (my >= allJobs.length) return
-        await runOne(allJobs[my])
+    while (taskCursor < totalTasks && !cancelRef.current) {
+      const batchStart = taskCursor
+      const batchEnd = Math.min(batchStart + BATCH_WINDOW_SIZE, totalTasks)
+      const batchTasks = taskQueue.slice(batchStart, batchEnd)
+      const currentBatchSize = batchTasks.length
+
+      // 为当前批次创建 job 显示
+      const batchJobs: Job[] = batchTasks.map((task) => ({
+        id: crypto.randomUUID(),
+        file: task.file,
+        previewObjectUrl: task.file ? URL.createObjectURL(task.file) : undefined,
+        status: 'queued' as JobStatus,
+        jobType: task.jobType,
+        prompt: task.prompt,
+        addedSeq: addedSeqRef.current++,
+      }))
+
+      setJobs((prev) => {
+        // 清除上一批次的 jobs，只显示当前批次
+        // 但保留已完成的 jobs 用于历史记录
+        const completedJobs = prev.filter(j => j.status === 'done' || j.status === 'error')
+        return [...completedJobs, ...batchJobs]
+      })
+
+      // 并发处理当前批次
+      const concurrency = Math.min(normalizeBatchConcurrency(concurrencyInput), currentBatchSize)
+      let taskIdxInBatch = 0
+
+      const worker = async () => {
+        while (!cancelRef.current) {
+          const myTask = taskIdxInBatch++
+          if (myTask >= batchTasks.length) return
+
+          const task = batchTasks[myTask]
+          const jobId = batchJobs[myTask].id
+
+          // 更新状态为运行中
+          updateJob(jobId, { status: 'running' })
+
+          try {
+            const result = await runOneTask(task)
+            if (result) {
+              updateJob(jobId, {
+                status: 'done',
+                resultDataUrl: result.resultDataUrl,
+                completedAt: Date.now(),
+                outputName: result.outputName,
+              })
+              // 自动保存
+              void saveJobToFolder(
+                {
+                  ...batchJobs[myTask],
+                  resultDataUrl: result.resultDataUrl,
+                  outputName: result.outputName,
+                },
+                autoSaveUsedNamesRef.current
+              )
+            } else {
+              // 被取消，恢复为 queued
+              updateJob(jobId, { status: 'queued' })
+            }
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            updateJob(jobId, { status: 'error', error: msg })
+          }
+
+          // 更新已处理计数
+          setProcessedTaskCount((prev) => prev + 1)
+
+          // 如果是图片任务，追踪已处理的文件数
+          if (task.fileIndex !== undefined) {
+            processedFileCount++
+            // 当处理完 BATCH_WINDOW_SIZE 个图片任务后，从 inputFiles 移除
+            if (processedFileCount % BATCH_WINDOW_SIZE === 0) {
+              const filesToRemove = Math.floor(processedFileCount / BATCH_WINDOW_SIZE) * BATCH_WINDOW_SIZE
+              if (filesToRemove > processedFileIndexRef.current && filesToRemove <= inputFiles.length) {
+                // 移除已处理的文件
+                setInputFiles((prev) => {
+                  const remaining = prev.slice(filesToRemove - processedFileIndexRef.current)
+                  return remaining
+                })
+                processedFileIndexRef.current = filesToRemove
+              }
+            }
+          }
+        }
+      }
+
+      await Promise.all(Array.from({ length: concurrency }, () => worker()))
+
+      // 批次完成后，等待一小延迟再加载下一批
+      if (!cancelRef.current && batchEnd < totalTasks) {
+        await new Promise(resolve => setTimeout(resolve, 300))
       }
     }
-
-    await Promise.all(Array.from({ length: n }, () => worker()))
 
     abortRef.current = null
     setIsRunning(false)
@@ -407,15 +506,19 @@ export default function App() {
     enableOutpaint,
     enableVariation,
     enableText2Img,
-    inputFiles,
+    inputFiles.length,  // 注意：这里只依赖 length，因为我们会在处理中修改 inputFiles
     excelPrompts,
     expansionScale,
     variationCount,
     model,
     size,
+    customSize,
+    useCustomSize,
     prefix,
+    concurrencyInput,
     updateJob,
     generateOutputName,
+    saveJobToFolder,
   ])
 
   const downloadOne = useCallback((job: Job) => {
@@ -426,6 +529,51 @@ export default function App() {
     a.download = `${job.outputName ?? 'image'}.${ext}`
     a.click()
   }, [])
+
+  // 删除单个 job
+  const removeJob = useCallback((jobId: string) => {
+    if (isRunning) return
+    setJobs((prev) => {
+      const job = prev.find(j => j.id === jobId)
+      if (job?.previewObjectUrl) {
+        try { URL.revokeObjectURL(job.previewObjectUrl) } catch {}
+      }
+      return prev.filter(j => j.id !== jobId)
+    })
+  }, [isRunning])
+
+  // 选择保存文件夹
+  const onChangeSaveFolder = useCallback(() => {
+    saveFolderHandleRef.current = null
+    setSaveFolderName(null)
+    autoSaveUsedNamesRef.current = new Set()
+  }, [])
+
+  const onSaveToFolder = useCallback(async () => {
+    const done = jobs.filter((j) => j.status === 'done' && j.resultDataUrl)
+    if (done.length === 0) {
+      alert('还没有生成完成的图片。')
+      return
+    }
+    try {
+      let dir = saveFolderHandleRef.current
+      if (!dir) {
+        dir = await pickSaveDirectoryHandle()
+        saveFolderHandleRef.current = dir
+        setSaveFolderName(dir.name)
+      }
+      const used = new Set<string>()
+      for (const job of done) {
+        if (job.resultDataUrl && job.outputName) {
+          await writeImageToDirectory(dir, job.resultDataUrl, `${job.outputName}.${extensionFromMime(job.resultDataUrl)}`, used)
+        }
+      }
+      alert(`已保存 ${done.length} 张图片到「${dir.name}」。`)
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      alert(err instanceof Error ? err.message : String(err))
+    }
+  }, [jobs])
 
   const downloadZip = useCallback(async () => {
     const done = jobs.filter((j) => j.status === 'done' && j.resultDataUrl)
@@ -496,7 +644,7 @@ export default function App() {
                 type="url"
                 value={apiBase}
                 onChange={(e) => setApiBase(e.target.value)}
-                placeholder="https://ai.t8star.cn"
+                placeholder="https://ai.t8star.org"
               />
             </div>
             <div className="field">
@@ -508,6 +656,28 @@ export default function App() {
                 onChange={(e) => setModel(e.target.value)}
                 placeholder="gpt-image-2"
               />
+            </div>
+            <div className="field">
+              <label htmlFor="concurrency">并发数</label>
+              <input
+                id="concurrency"
+                type="text"
+                inputMode="numeric"
+                autoComplete="off"
+                value={concurrencyInput}
+                disabled={isRunning}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (v === '' || /^\d{1,2}$/.test(v)) {
+                    setConcurrencyInput(v)
+                  }
+                }}
+                onBlur={commitConcurrencyInput}
+                placeholder={String(DEFAULT_BATCH_CONCURRENCY)}
+              />
+              <span className="field-hint">
+                同时处理的请求数（{MIN_BATCH_CONCURRENCY}-{MAX_BATCH_CONCURRENCY}）
+              </span>
             </div>
           </div>
 
@@ -549,15 +719,33 @@ export default function App() {
               <label htmlFor="size">输出尺寸</label>
               <select
                 id="size"
-                value={size}
-                onChange={(e) => setSize(e.target.value)}
+                value={useCustomSize ? 'custom' : size}
+                onChange={(e) => {
+                  if (e.target.value === 'custom') {
+                    setUseCustomSize(true)
+                    setCustomSize(size)
+                  } else {
+                    setUseCustomSize(false)
+                    setSize(e.target.value)
+                  }
+                }}
               >
                 {SIZE_OPTIONS.map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>
                 ))}
+                <option value="custom">自定义...</option>
               </select>
+              {useCustomSize && (
+                <input
+                  type="text"
+                  value={customSize}
+                  onChange={(e) => setCustomSize(e.target.value)}
+                  placeholder="宽 x 高，如 1024x1024"
+                  className="custom-size-input"
+                />
+              )}
             </div>
             <div className="field">
               <label htmlFor="prefix">图片名前缀</label>
@@ -621,24 +809,26 @@ export default function App() {
                   上传图片或选择文件夹，支持多选 · 粘贴 (Ctrl/Cmd + V)
                 </p>
 
-                <div
-                  className={`dropzone${dragOver ? ' drag' : ''}`}
-                  onDragOver={(e) => {
-                    e.preventDefault()
-                    setDragOver(true)
-                  }}
-                  onDragLeave={() => setDragOver(false)}
-                  onDrop={handleDrop}
-                  onPaste={handlePaste}
-                >
-                  <p className="dropzone-title">拖入图片，或点击选择</p>
-                  <p className="dropzone-sub">支持多选 · 文件夹导入</p>
-                  <label className="btn btn-secondary dropzone-btn">
-                    选择图片/文件夹
+                <div className="excel-upload-row">
+                  <label className="btn btn-secondary">
+                    选择图片
                     <input
                       type="file"
                       accept="image/*"
                       multiple
+                      disabled={isRunning}
+                      onChange={(e) => {
+                        if (e.target.files?.length) {
+                          handleFilesSelected(e.target.files)
+                        }
+                        e.target.value = ''
+                      }}
+                    />
+                  </label>
+                  <label className="btn btn-secondary">
+                    选择文件夹
+                    <input
+                      type="file"
                       // @ts-ignore - webkitdirectory 是非标准属性
                       webkitdirectory=""
                       disabled={isRunning}
@@ -655,7 +845,7 @@ export default function App() {
                 {inputFiles.length > 0 && (
                   <div className="input-files-list">
                     <div className="input-files-header">
-                      <span>已添加 {inputFiles.length} 张图片</span>
+                      <span>已添加 {inputFiles.length} 张图片（显示前 20 张）</span>
                       <button
                         type="button"
                         className="btn btn-ghost"
@@ -666,7 +856,7 @@ export default function App() {
                       </button>
                     </div>
                     <div className="input-files-grid">
-                      {inputFiles.map((file, index) => (
+                      {inputFiles.slice(0, 20).map((file, index) => (
                         <div key={`${file.name}-${index}`} className="input-file-item">
                           <img
                             src={URL.createObjectURL(file)}
@@ -729,7 +919,7 @@ export default function App() {
 
                 {excelFile && (
                   <div className="excel-preview">
-                    <div className="prompts-header">
+                    <div className="excel-preview-header">
                       <span>文件：{excelFile.name} · 共 {excelPrompts.length} 个提示词</span>
                       <button
                         type="button"
@@ -740,44 +930,54 @@ export default function App() {
                         清空
                       </button>
                     </div>
+
+                    {/* Excel 表格预览 - 显示前 5 行 */}
                     {excelPreview.length > 0 && (
-                      <div className="excel-table-wrapper">
-                        <table className="excel-table">
-                          <tbody>
-                            {excelPreview.slice(0, 10).map((row, i) => (
-                              <tr key={i}>
-                                {row.map((cell, j) => (
-                                  <td key={j}>{cell}</td>
-                                ))}
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                        {excelPreview.length > 10 && (
-                          <p className="excel-more">... 还有 {excelPreview.length - 10} 行</p>
-                        )}
+                      <details className="excel-details">
+                        <summary className="excel-details-summary">
+                          <span>表格预览（前 5 行）</span>
+                        </summary>
+                        <div className="excel-table-wrapper">
+                          <table className="excel-table">
+                            <tbody>
+                              {excelPreview.slice(0, 5).map((row, i) => (
+                                <tr key={i}>
+                                  {row.map((cell, j) => (
+                                    <td key={j} title={cell || ''}>{cell}</td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {excelPreview.length > 5 && (
+                            <p className="excel-more">... 还有 {excelPreview.length - 5} 行</p>
+                          )}
+                        </div>
+                      </details>
+                    )}
+
+                    {/* 提示词列表 */}
+                    {excelPrompts.length > 0 && (
+                      <div className="prompts-list">
+                        <div className="prompts-scroll">
+                          {excelPrompts.map((p, index) => (
+                            <div key={p.id} className="prompt-item">
+                              <span className="prompt-index">{index + 1}.</span>
+                              <span className="prompt-text" title={p.prompt}>{p.prompt}</span>
+                              <button
+                                type="button"
+                                className="btn btn-ghost prompt-remove"
+                                disabled={isRunning}
+                                onClick={() => removeExcelPrompt(p.id)}
+                                title="删除此提示词"
+                              >
+                                ×
+                              </button>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
-                  </div>
-                )}
-
-                {excelPrompts.length > 0 && (
-                  <div className="prompts-list">
-                    <div className="prompts-scroll">
-                      {excelPrompts.map((p) => (
-                        <div key={p.id} className="prompt-item">
-                          <span className="prompt-text">{p.prompt}</span>
-                          <button
-                            type="button"
-                            className="btn btn-ghost prompt-remove"
-                            disabled={isRunning}
-                            onClick={() => removeExcelPrompt(p.id)}
-                          >
-                            ×
-                          </button>
-                        </div>
-                      ))}
-                    </div>
                   </div>
                 )}
               </div>
@@ -809,7 +1009,39 @@ export default function App() {
               >
                 打包下载 ZIP ({jobStats.done})
               </button>
+              {supportsSaveToFolder() ? (
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={isRunning || jobStats.done === 0}
+                  onClick={() => void onSaveToFolder()}
+                >
+                  {saveFolderName ? `保存到「${saveFolderName}」` : '选择文件夹并保存…'}
+                </button>
+              ) : null}
+              {saveFolderName ? (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={isRunning}
+                  onClick={onChangeSaveFolder}
+                >
+                  更换文件夹
+                </button>
+              ) : null}
             </div>
+            {supportsSaveToFolder() && (
+              <label className="feature-toggle" style={{ marginTop: '0.5rem' }}>
+                <input
+                  type="checkbox"
+                  checked={autoSaveAfterGenerate}
+                  onChange={(e) => setAutoSaveAfterGenerate(e.target.checked)}
+                />
+                <span>
+                  生成后自动保存（每张图生成完成后自动写入「{saveFolderName ?? '请先选择文件夹'}」）
+                </span>
+              </label>
+            )}
 
             {!canStart && !isRunning ? (
               <p className="action-hint">
@@ -820,18 +1052,36 @@ export default function App() {
             ) : null}
 
             {isRunning && jobs.length > 0 ? (
-              <p className="progress-line">
-                进度：已完成 {jobStats.done} / {jobStats.total}
-                {jobStats.running > 0 ? ` · 进行中 ${jobStats.running}` : ''}
-                {jobStats.error > 0 ? ` · 失败 ${jobStats.error}` : ''}
-              </p>
+              <>
+                <p className="progress-line">
+                  进度：已完成 {jobStats.done} / {jobStats.total}（当前批次）
+                  {jobStats.running > 0 ? ` · 进行中 ${jobStats.running}` : ''}
+                  {jobStats.error > 0 ? ` · 失败 ${jobStats.error}` : ''}
+                </p>
+                {totalTaskCount > BATCH_WINDOW_SIZE && (
+                  <p className="progress-line">
+                    总进度：{processedTaskCount} / {totalTaskCount}（共 {Math.ceil(totalTaskCount / BATCH_WINDOW_SIZE)} 批）
+                  </p>
+                )}
+              </>
             ) : null}
           </div>
 
           {/* 生成结果 */}
           {jobs.length > 0 && (
             <div className="results-section">
-              <h2 className="results-heading">生成结果</h2>
+              <div className="results-header">
+                <h2 className="results-heading">生成结果</h2>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  disabled={isRunning}
+                  onClick={() => setJobs([])}
+                  title="清空所有生成的图片"
+                >
+                  全部清空
+                </button>
+              </div>
               <div className="job-grid">
                 {displayJobs.map((job) => (
                   <article key={job.id} className="job-card">
@@ -842,6 +1092,15 @@ export default function App() {
                       <span className={`status status-${job.status}`}>
                         {job.status === 'queued' ? '等待' : job.status === 'running' ? '生成中' : job.status === 'done' ? '完成' : '失败'}
                       </span>
+                      <button
+                        type="button"
+                        className="btn btn-ghost job-remove"
+                        disabled={isRunning}
+                        onClick={() => removeJob(job.id)}
+                        title="删除此项目"
+                      >
+                        ×
+                      </button>
                     </div>
                     <div className="job-meta">
                       <span className="job-type">

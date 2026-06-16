@@ -1,7 +1,24 @@
-export const DEFAULT_API_BASE = 'https://ai.t8star.cn'
+export const DEFAULT_API_BASE = 'https://ai.t8star.org'
 
-/** 批量生成时最多同时发起的请求数 */
-export const MAX_BATCH_CONCURRENCY = 3
+/** 并发数下限 / 上限 / 默认值 */
+export const MIN_BATCH_CONCURRENCY = 1
+export const MAX_BATCH_CONCURRENCY = 20
+export const DEFAULT_BATCH_CONCURRENCY = 10
+
+export const STORAGE_KEY_CONCURRENCY = 'batch_image_concurrency'
+
+/** 将输入框字符串规范为合法并发数（空或非法时用 fallback） */
+export function normalizeBatchConcurrency(
+  raw: string,
+  fallback: number = DEFAULT_BATCH_CONCURRENCY,
+): number {
+  const n = parseInt(raw.trim(), 10)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(MIN_BATCH_CONCURRENCY, Math.min(MAX_BATCH_CONCURRENCY, n))
+}
+
+/** 每批次显示和处理的图片数量 */
+export const BATCH_WINDOW_SIZE = 10
 
 export const DEFAULT_MODEL = 'gpt-image-2'
 
