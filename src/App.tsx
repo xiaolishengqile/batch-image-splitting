@@ -11,6 +11,8 @@ import {
   DEFAULT_VARIATION_COUNT,
   DEFAULT_EXPANSION_SCALE,
   BATCH_WINDOW_SIZE,
+  BATCH_TIMEOUT_MS,
+  BATCH_TIMEOUT_MESSAGE,
   DEFAULT_BATCH_CONCURRENCY,
   MAX_BATCH_CONCURRENCY,
   MIN_BATCH_CONCURRENCY,
@@ -368,10 +370,14 @@ export default function App() {
       }
     }
 
-    const runOneTask = async (task: TaskItem): Promise<{ outputName: string; resultDataUrl: string } | null> => {
-      if (cancelRef.current) return null
+    const runOneTask = async (
+      task: TaskItem,
+      batchCtx: { timedOut: { current: boolean }; activeControllers: Set<AbortController> },
+    ): Promise<{ outputName: string; resultDataUrl: string } | null> => {
+      if (cancelRef.current || batchCtx.timedOut.current) return null
 
       const ac = new AbortController()
+      batchCtx.activeControllers.add(ac)
       abortRef.current = ac
 
       try {
@@ -409,13 +415,17 @@ export default function App() {
           imageDataUrl = result.imageDataUrl
         }
 
+        if (batchCtx.timedOut.current) return null
+
         const outputName = generateOutputName(prefix, outputSeq++)
         return { outputName, resultDataUrl: imageDataUrl }
       } catch (e) {
-        if (cancelRef.current || (e instanceof DOMException && e.name === 'AbortError')) {
+        if (cancelRef.current || batchCtx.timedOut.current || (e instanceof DOMException && e.name === 'AbortError')) {
           return null
         }
         throw e
+      } finally {
+        batchCtx.activeControllers.delete(ac)
       }
     }
 
@@ -446,9 +456,22 @@ export default function App() {
 
         const concurrency = Math.min(normalizeBatchConcurrency(normalizedConcurrency), currentBatchSize)
         let taskIdxInBatch = 0
+        const batchCtx = {
+          timedOut: { current: false },
+          activeControllers: new Set<AbortController>(),
+        }
+        const jobSettled = new Set<string>()
+
+        const markJobFinished = (jobId: string, patch: Partial<Job>) => {
+          updateJob(jobId, patch)
+          if (!jobSettled.has(jobId)) {
+            jobSettled.add(jobId)
+            setProcessedTaskCount((prev) => prev + 1)
+          }
+        }
 
         const worker = async () => {
-          while (!cancelRef.current) {
+          while (!cancelRef.current && !batchCtx.timedOut.current) {
             const myTask = taskIdxInBatch++
             if (myTask >= batchTasks.length) return
 
@@ -458,9 +481,9 @@ export default function App() {
             updateJob(jobId, { status: 'running' })
 
             try {
-              const result = await runOneTask(task)
+              const result = await runOneTask(task, batchCtx)
               if (result) {
-                updateJob(jobId, {
+                markJobFinished(jobId, {
                   status: 'done',
                   resultDataUrl: result.resultDataUrl,
                   completedAt: Date.now(),
@@ -474,19 +497,43 @@ export default function App() {
                   },
                   autoSaveUsedNamesRef.current,
                 )
-              } else {
+              } else if (batchCtx.timedOut.current) {
+                markJobFinished(jobId, { status: 'error', error: BATCH_TIMEOUT_MESSAGE })
+              } else if (cancelRef.current) {
                 updateJob(jobId, { status: 'queued' })
+                if (!jobSettled.has(jobId)) {
+                  jobSettled.add(jobId)
+                  setProcessedTaskCount((prev) => prev + 1)
+                }
+              } else {
+                markJobFinished(jobId, { status: 'error', error: '任务已中断' })
               }
             } catch (e) {
               const msg = e instanceof Error ? e.message : String(e)
-              updateJob(jobId, { status: 'error', error: msg })
+              markJobFinished(jobId, { status: 'error', error: msg })
             }
-
-            setProcessedTaskCount((prev) => prev + 1)
           }
         }
 
-        await Promise.all(Array.from({ length: concurrency }, () => worker()))
+        const workersPromise = Promise.all(Array.from({ length: concurrency }, () => worker()))
+
+        const batchTimer = setTimeout(() => {
+          batchCtx.timedOut.current = true
+          for (const ac of batchCtx.activeControllers) {
+            ac.abort()
+          }
+        }, BATCH_TIMEOUT_MS)
+
+        await workersPromise
+        clearTimeout(batchTimer)
+
+        if (batchCtx.timedOut.current) {
+          for (const job of batchJobs) {
+            if (!jobSettled.has(job.id)) {
+              markJobFinished(job.id, { status: 'error', error: BATCH_TIMEOUT_MESSAGE })
+            }
+          }
+        }
 
         taskCursor = batchEnd
 
@@ -770,48 +817,6 @@ export default function App() {
             </div>
           </div>
 
-          {supportsSaveToFolder() ? (
-            <div className="sidebar-card">
-              <h3>保存位置</h3>
-              <p className="save-folder-status">
-                {saveFolderName ? (
-                  <>当前文件夹：<strong>{saveFolderName}</strong></>
-                ) : (
-                  '尚未选择，生成前可先指定保存目录'
-                )}
-              </p>
-              <div className="save-folder-actions">
-                <button
-                  type="button"
-                  className="btn btn-secondary"
-                  disabled={isRunning}
-                  onClick={() => void onPickSaveFolder()}
-                >
-                  {saveFolderName ? '更换文件夹' : '选择保存文件夹'}
-                </button>
-                {saveFolderName ? (
-                  <button
-                    type="button"
-                    className="btn btn-ghost"
-                    disabled={isRunning}
-                    onClick={onClearSaveFolder}
-                  >
-                    清除
-                  </button>
-                ) : null}
-              </div>
-              <label className="feature-toggle save-folder-auto">
-                <input
-                  type="checkbox"
-                  checked={autoSaveAfterGenerate}
-                  disabled={isRunning}
-                  onChange={(e) => setAutoSaveAfterGenerate(e.target.checked)}
-                />
-                <span>生成后自动保存到上述文件夹</span>
-              </label>
-            </div>
-          ) : null}
-
           {/* 功能特定设置 */}
           {(enableOutpaint || enableVariation) && (
             <div className="sidebar-card">
@@ -878,7 +883,7 @@ export default function App() {
                     />
                   </label>
                   <label className="btn btn-secondary">
-                    选择文件夹
+                    从文件夹导入
                     <input
                       type="file"
                       // @ts-ignore - webkitdirectory 是非标准属性
@@ -1039,6 +1044,56 @@ export default function App() {
           {/* 执行按钮 */}
           <div className="action-card">
             <h3>🚀 开始处理</h3>
+
+            {supportsSaveToFolder() ? (
+              <div className="action-save-folder">
+                <div className="action-save-folder-head">
+                  <span className="action-save-folder-label">保存位置</span>
+                  <span className={`action-save-folder-value${saveFolderName ? ' is-set' : ''}`}>
+                    {saveFolderName ? saveFolderName : '未选择'}
+                  </span>
+                </div>
+                <div className="action-save-folder-row">
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled={isRunning}
+                    onClick={() => void onPickSaveFolder()}
+                  >
+                    {saveFolderName ? '更换保存文件夹' : '选择保存文件夹'}
+                  </button>
+                  {saveFolderName ? (
+                    <button
+                      type="button"
+                      className="btn btn-ghost"
+                      disabled={isRunning}
+                      onClick={onClearSaveFolder}
+                    >
+                      清除
+                    </button>
+                  ) : null}
+                  <label className="feature-toggle action-save-folder-auto">
+                    <input
+                      type="checkbox"
+                      checked={autoSaveAfterGenerate}
+                      disabled={isRunning}
+                      onChange={(e) => setAutoSaveAfterGenerate(e.target.checked)}
+                    />
+                    <span>生成后自动保存</span>
+                  </label>
+                </div>
+                {!saveFolderName && canStart && !isRunning ? (
+                  <p className="action-hint action-save-folder-hint">
+                    建议生成前先选择保存文件夹；未选择时结果仅显示在页面中，需手动打包 ZIP 下载。
+                  </p>
+                ) : null}
+              </div>
+            ) : (
+              <p className="action-hint action-save-folder-hint">
+                当前浏览器不支持直接保存到本地文件夹，请使用「打包下载 ZIP」。
+              </p>
+            )}
+
             <div className="action-row">
               <button
                 type="button"

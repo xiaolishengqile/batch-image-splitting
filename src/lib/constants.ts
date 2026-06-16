@@ -20,6 +20,11 @@ export function normalizeBatchConcurrency(
 /** 每批次显示和处理的图片数量 */
 export const BATCH_WINDOW_SIZE = 10
 
+/** 单批次最长等待时间（毫秒），超时后未完成的图片跳过并进入下一批 */
+export const BATCH_TIMEOUT_MS = 3 * 60 * 1000
+
+export const BATCH_TIMEOUT_MESSAGE = '批次超时（3 分钟），已跳过继续下一批'
+
 export const DEFAULT_MODEL = 'gpt-image-2'
 
 /** 图片扩充提示词 */
