@@ -184,6 +184,29 @@
   line-height: 1.4;
 }
 
+.save-folder-status {
+  margin: 0 0 0.6rem;
+  font-size: 0.8rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.save-folder-status strong {
+  color: var(--fg);
+  font-weight: 600;
+}
+
+.save-folder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.6rem;
+}
+
+.save-folder-auto {
+  margin-top: 0;
+}
+
 .custom-size-input {
   margin-top: 0.5rem;
   width: 100%;

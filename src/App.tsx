@@ -330,6 +330,11 @@ export default function App() {
       return
     }
 
+    if (autoSaveAfterGenerate && !saveFolderHandleRef.current) {
+      alert('已开启「生成后自动保存」，请先在左侧选择保存文件夹。')
+      return
+    }
+
     const totalTasks = taskQueue.length
     setTotalTaskCount(totalTasks)
     setProcessedTaskCount(0)
@@ -513,6 +518,7 @@ export default function App() {
     updateJob,
     generateOutputName,
     saveJobToFolder,
+    autoSaveAfterGenerate,
   ])
 
   const downloadOne = useCallback((job: Job) => {
@@ -536,26 +542,36 @@ export default function App() {
     })
   }, [isRunning])
 
-  // 选择保存文件夹
-  const onChangeSaveFolder = useCallback(() => {
+  const onPickSaveFolder = useCallback(async () => {
+    try {
+      const dir = await pickSaveDirectoryHandle()
+      saveFolderHandleRef.current = dir
+      setSaveFolderName(dir.name)
+      autoSaveUsedNamesRef.current = new Set()
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') return
+      alert(err instanceof Error ? err.message : String(err))
+    }
+  }, [])
+
+  const onClearSaveFolder = useCallback(() => {
     saveFolderHandleRef.current = null
     setSaveFolderName(null)
     autoSaveUsedNamesRef.current = new Set()
   }, [])
 
-  const onSaveToFolder = useCallback(async () => {
+  const onSaveDoneToFolder = useCallback(async () => {
     const done = jobs.filter((j) => j.status === 'done' && j.resultDataUrl)
     if (done.length === 0) {
       alert('还没有生成完成的图片。')
       return
     }
+    const dir = saveFolderHandleRef.current
+    if (!dir) {
+      alert('请先在左侧「保存位置」中选择文件夹。')
+      return
+    }
     try {
-      let dir = saveFolderHandleRef.current
-      if (!dir) {
-        dir = await pickSaveDirectoryHandle()
-        saveFolderHandleRef.current = dir
-        setSaveFolderName(dir.name)
-      }
       const used = new Set<string>()
       for (const job of done) {
         if (job.resultDataUrl && job.outputName) {
@@ -753,6 +769,48 @@ export default function App() {
               <span className="field-hint">示例：A1, A2, A3...</span>
             </div>
           </div>
+
+          {supportsSaveToFolder() ? (
+            <div className="sidebar-card">
+              <h3>保存位置</h3>
+              <p className="save-folder-status">
+                {saveFolderName ? (
+                  <>当前文件夹：<strong>{saveFolderName}</strong></>
+                ) : (
+                  '尚未选择，生成前可先指定保存目录'
+                )}
+              </p>
+              <div className="save-folder-actions">
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  disabled={isRunning}
+                  onClick={() => void onPickSaveFolder()}
+                >
+                  {saveFolderName ? '更换文件夹' : '选择保存文件夹'}
+                </button>
+                {saveFolderName ? (
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    disabled={isRunning}
+                    onClick={onClearSaveFolder}
+                  >
+                    清除
+                  </button>
+                ) : null}
+              </div>
+              <label className="feature-toggle save-folder-auto">
+                <input
+                  type="checkbox"
+                  checked={autoSaveAfterGenerate}
+                  disabled={isRunning}
+                  onChange={(e) => setAutoSaveAfterGenerate(e.target.checked)}
+                />
+                <span>生成后自动保存到上述文件夹</span>
+              </label>
+            </div>
+          ) : null}
 
           {/* 功能特定设置 */}
           {(enableOutpaint || enableVariation) && (
@@ -1007,35 +1065,14 @@ export default function App() {
                 <button
                   type="button"
                   className="btn btn-secondary"
-                  disabled={isRunning || jobStats.done === 0}
-                  onClick={() => void onSaveToFolder()}
+                  disabled={isRunning || jobStats.done === 0 || !saveFolderName}
+                  onClick={() => void onSaveDoneToFolder()}
+                  title={saveFolderName ? undefined : '请先在左侧选择保存文件夹'}
                 >
-                  {saveFolderName ? `保存到「${saveFolderName}」` : '选择文件夹并保存…'}
-                </button>
-              ) : null}
-              {saveFolderName ? (
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  disabled={isRunning}
-                  onClick={onChangeSaveFolder}
-                >
-                  更换文件夹
+                  保存已完成到文件夹 ({jobStats.done})
                 </button>
               ) : null}
             </div>
-            {supportsSaveToFolder() && (
-              <label className="feature-toggle" style={{ marginTop: '0.5rem' }}>
-                <input
-                  type="checkbox"
-                  checked={autoSaveAfterGenerate}
-                  onChange={(e) => setAutoSaveAfterGenerate(e.target.checked)}
-                />
-                <span>
-                  生成后自动保存（每张图生成完成后自动写入「{saveFolderName ?? '请先选择文件夹'}」）
-                </span>
-              </label>
-            )}
 
             {!canStart && !isRunning ? (
               <p className="action-hint">
