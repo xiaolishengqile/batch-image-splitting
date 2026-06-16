@@ -643,6 +643,10 @@ label.btn,
 .action-save-folder-value.is-set {
   color: var(--accent);
   font-weight: 600;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .action-save-folder-row {
@@ -680,6 +684,29 @@ label.btn,
   font-weight: 600;
 }
 
+.batch-hint,
+.task-order-hint,
+.results-summary,
+.token-privacy-hint {
+  margin: 0.35rem 0 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.input-dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 10px;
+  padding: 0.75rem;
+  background: var(--input-bg);
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.input-dropzone.is-dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
 /* 结果区域 */
 .results-section {
   padding: 0.875rem;
@@ -690,9 +717,18 @@ label.btn,
 
 .results-header {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
+  gap: 0.5rem;
   margin-bottom: 0.6rem;
+}
+
+.results-header .results-summary {
+  margin: 0;
+  flex: 1;
+  text-align: center;
+  font-size: 0.8rem;
 }
 
 .results-heading {
@@ -843,6 +879,10 @@ label.btn,
   line-height: 1.35;
   border-top: 1px solid var(--border);
   background: rgba(220, 38, 38, 0.08);
+  max-height: 4.5rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .job-actions {
@@ -879,6 +919,15 @@ label.btn,
 @media (max-width: 640px) {
   .app-header h1 {
     font-size: 1.2rem;
+  }
+
+  .action-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .action-row .btn {
+    width: 100%;
   }
 
   .job-grid {

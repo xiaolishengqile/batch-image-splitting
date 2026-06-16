@@ -13,24 +13,31 @@ import {
   BATCH_WINDOW_SIZE,
   BATCH_TIMEOUT_MS,
   BATCH_TIMEOUT_MESSAGE,
+  CANCEL_MESSAGE,
   DEFAULT_BATCH_CONCURRENCY,
   MAX_BATCH_CONCURRENCY,
   MIN_BATCH_CONCURRENCY,
   normalizeBatchConcurrency,
   PROMPT_OUTPAINT_CN,
   STORAGE_KEY_CONCURRENCY,
-  PROMPT_VARIATION,
+  PROMPT_VARIATION_CN,
   SIZE_OPTIONS,
   STORAGE_KEY_BASE,
+  STORAGE_KEY_MODEL,
   STORAGE_KEY_TOKEN,
   STORAGE_KEY_SIZE,
   STORAGE_KEY_PREFIX,
   STORAGE_KEY_EXPANSION_SCALE,
   STORAGE_KEY_VARIATION_COUNT,
 } from './lib/constants'
-import { supportsSaveToFolder, pickSaveDirectoryHandle, writeImageToDirectory } from './lib/files'
+import {
+  supportsSaveToFolder,
+  pickSaveDirectoryHandle,
+  writeImageToDirectory,
+  getImageFilesFromDataTransfer,
+} from './lib/files'
 import { closestAspectLabel, is2kSizeLabel, sizeForAspect } from './lib/imageAspect'
-import { calculateExpandedSize, getImageDimensions } from './lib/imageSize'
+import { calculateExpandedSize, getImageDimensions, isValidSizeFormat } from './lib/imageSize'
 import './App.css'
 
 type JobStatus = 'queued' | 'running' | 'done' | 'error'
@@ -49,9 +56,6 @@ interface Job {
   prompt?: string
   targetSize?: string
   outputName?: string
-  // 分批处理相关
-  batchIndex?: number  // 当前任务在批次中的索引 (0-9)
-  totalBatches?: number  // 总批次数
 }
 
 interface ExcelPrompt {
@@ -71,6 +75,42 @@ function extensionFromMime(dataUrl: string): string {
   return 'png'
 }
 
+function truncateLabel(text: string, maxLen: number): string {
+  if (text.length <= maxLen) return text
+  return `${text.slice(0, maxLen)}…`
+}
+
+function cellToPrompt(cell: unknown): string | null {
+  if (cell == null || cell === '') return null
+  if (typeof cell === 'string') {
+    const trimmed = cell.trim()
+    return trimmed || null
+  }
+  if (typeof cell === 'number' || typeof cell === 'boolean') {
+    const trimmed = String(cell).trim()
+    return trimmed || null
+  }
+  return null
+}
+
+function revokeJobPreview(job: Job) {
+  if (job.previewObjectUrl) {
+    try {
+      URL.revokeObjectURL(job.previewObjectUrl)
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function readInitialSizeState(): { size: string; customSize: string; useCustomSize: boolean } {
+  const saved = localStorage.getItem(STORAGE_KEY_SIZE) ?? DEFAULT_SIZE
+  if (SIZE_OPTIONS.includes(saved)) {
+    return { size: saved, customSize: '', useCustomSize: false }
+  }
+  return { size: DEFAULT_SIZE, customSize: saved, useCustomSize: true }
+}
+
 export default function App() {
   // API 设置 - 如果 localStorage 中是 .cn 域名，自动修正为 .org
   const [apiBase, setApiBase] = useState(() => {
@@ -84,24 +124,27 @@ export default function App() {
     return saved ?? DEFAULT_API_BASE
   })
   const [apiToken, setApiToken] = useState(() => localStorage.getItem(STORAGE_KEY_TOKEN) ?? '')
-  const [model, setModel] = useState(DEFAULT_MODEL)
-  const [size, setSize] = useState(() => localStorage.getItem(STORAGE_KEY_SIZE) ?? DEFAULT_SIZE)
-  const [customSize, setCustomSize] = useState('')
-  const [useCustomSize, setUseCustomSize] = useState(false)
+  const initialSizeState = useMemo(() => readInitialSizeState(), [])
+  const [model, setModel] = useState(() => localStorage.getItem(STORAGE_KEY_MODEL) ?? DEFAULT_MODEL)
+  const [size, setSize] = useState(initialSizeState.size)
+  const [customSize, setCustomSize] = useState(initialSizeState.customSize)
+  const [useCustomSize, setUseCustomSize] = useState(initialSizeState.useCustomSize)
   const [prefix, setPrefix] = useState(() => localStorage.getItem(STORAGE_KEY_PREFIX) ?? 'A')
 
   // 功能设置
   const [expansionScale, setExpansionScale] = useState(
     () => localStorage.getItem(STORAGE_KEY_EXPANSION_SCALE) ?? DEFAULT_EXPANSION_SCALE,
   )
-  const [variationCount, setVariationCount] = useState(
-    () => parseInt(localStorage.getItem(STORAGE_KEY_VARIATION_COUNT) ?? String(DEFAULT_VARIATION_COUNT), 10),
-  )
+  const [variationCount, setVariationCount] = useState(() => {
+    const n = parseInt(localStorage.getItem(STORAGE_KEY_VARIATION_COUNT) ?? String(DEFAULT_VARIATION_COUNT), 10)
+    return Number.isFinite(n) ? Math.max(1, Math.min(10, n)) : DEFAULT_VARIATION_COUNT
+  })
 
   // 功能开关
   const [enableOutpaint, setEnableOutpaint] = useState(true)
   const [enableVariation, setEnableVariation] = useState(false)
   const [enableText2Img, setEnableText2Img] = useState(false)
+  const [isInputDragOver, setIsInputDragOver] = useState(false)
 
   // 数据状态
   const [inputFiles, setInputFiles] = useState<File[]>([])
@@ -117,8 +160,6 @@ export default function App() {
     if (!saved) return String(DEFAULT_BATCH_CONCURRENCY)
     return String(normalizeBatchConcurrency(saved))
   })
-  // 已处理的文件索引（用于从 inputFiles 中移除已处理完的文件）
-  const processedFileIndexRef = useRef<number>(0)
 
   // Excel 相关
   const [excelFile, setExcelFile] = useState<File | null>(null)
@@ -132,8 +173,13 @@ export default function App() {
 
   const addedSeqRef = useRef(0)
   const cancelRef = useRef(false)
-  const abortRef = useRef<AbortController | null>(null)
+  const activeAbortControllersRef = useRef<Set<AbortController>>(new Set())
   const runInProgressRef = useRef(false)
+
+  const inputPreviewUrls = useMemo(
+    () => inputFiles.map((file) => URL.createObjectURL(file)),
+    [inputFiles],
+  )
 
   // 持久化设置
   useEffect(() => {
@@ -142,6 +188,9 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_TOKEN, apiToken)
   }, [apiToken])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_MODEL, model)
+  }, [model])
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_SIZE, useCustomSize ? customSize : size)
   }, [size, customSize, useCustomSize])
@@ -160,19 +209,17 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY_CONCURRENCY, normalized)
   }, [concurrencyInput])
 
-  // 清理 URL 对象
   useEffect(() => {
     return () => {
-      inputFiles.forEach((f) => {
-        try { URL.revokeObjectURL(URL.createObjectURL(f)) } catch {}
-      })
-      jobs.forEach((j) => {
-        if (j.previewObjectUrl) {
-          try { URL.revokeObjectURL(j.previewObjectUrl) } catch {}
+      inputPreviewUrls.forEach((url) => {
+        try {
+          URL.revokeObjectURL(url)
+        } catch {
+          /* ignore */
         }
       })
     }
-  }, [inputFiles, jobs])
+  }, [inputPreviewUrls])
 
   const jobStats = useMemo(() => {
     let done = 0
@@ -197,6 +244,21 @@ export default function App() {
     setInputFiles((prev) => [...prev, ...arr])
   }, [])
 
+  useEffect(() => {
+    if (!enableOutpaint && !enableVariation) return
+    const onPaste = (e: ClipboardEvent) => {
+      if (isRunning) return
+      const dt = e.clipboardData
+      if (!dt) return
+      const files = getImageFilesFromDataTransfer(dt)
+      if (files.length === 0) return
+      e.preventDefault()
+      handleFilesSelected(files)
+    }
+    window.addEventListener('paste', onPaste)
+    return () => window.removeEventListener('paste', onPaste)
+  }, [isRunning, enableOutpaint, enableVariation, handleFilesSelected])
+
   // 移除输入文件
   const removeInputFile = useCallback((index: number) => {
     setInputFiles((prev) => prev.filter((_, i) => i !== index))
@@ -220,10 +282,11 @@ export default function App() {
     const prompts: ExcelPrompt[] = []
     data.forEach((row) => {
       row.forEach((cell) => {
-        if (cell && typeof cell === 'string' && cell.trim()) {
+        const prompt = cellToPrompt(cell)
+        if (prompt) {
           prompts.push({
             id: crypto.randomUUID(),
-            prompt: cell.trim(),
+            prompt,
             status: 'queued',
             addedSeq: addedSeqRef.current++,
           })
@@ -247,7 +310,10 @@ export default function App() {
   // 停止运行
   const stopRun = useCallback(() => {
     cancelRef.current = true
-    abortRef.current?.abort()
+    for (const ac of activeAbortControllersRef.current) {
+      ac.abort()
+    }
+    activeAbortControllersRef.current.clear()
   }, [])
 
   // 生成输出名称
@@ -270,7 +336,7 @@ export default function App() {
     }
   }, [autoSaveAfterGenerate])
 
-  // 运行批处理 - 分批处理版本（每批 10 个，处理完后从输入列表中移除）
+  // 运行批处理 - 分批处理版本（每批最多 10 张，单批最长 3 分钟）
   const runBatch = useCallback(async () => {
     if (runInProgressRef.current) return
 
@@ -292,7 +358,11 @@ export default function App() {
     // 快照当前输入，避免运行中 state 变化导致重复或遗漏
     const filesSnapshot = inputFiles
     const promptsSnapshot = excelPrompts
-    const baseSize = useCustomSize ? customSize : size
+    const baseSize = useCustomSize ? customSize.trim() : size
+    if (!isValidSizeFormat(baseSize)) {
+      alert('输出尺寸格式无效，请使用「宽x高」格式，例如 1024x1024。')
+      return
+    }
     const use2kOutput = is2kSizeLabel(baseSize)
 
     // 构建任务队列
@@ -333,14 +403,13 @@ export default function App() {
     }
 
     if (autoSaveAfterGenerate && !saveFolderHandleRef.current) {
-      alert('已开启「生成后自动保存」，请先在左侧选择保存文件夹。')
+      alert('已开启「生成后自动保存」，请先在「开始处理」区域选择保存文件夹。')
       return
     }
 
     const totalTasks = taskQueue.length
     setTotalTaskCount(totalTasks)
     setProcessedTaskCount(0)
-    processedFileIndexRef.current = 0
 
     runInProgressRef.current = true
     cancelRef.current = false
@@ -364,7 +433,7 @@ export default function App() {
       }
       const aspect = closestAspectLabel(width, height)
       return {
-        prompt: PROMPT_VARIATION,
+        prompt: PROMPT_VARIATION_CN,
         size: sizeForAspect(aspect, baseSize, use2kOutput),
         aspect_ratio: aspect,
       }
@@ -378,7 +447,7 @@ export default function App() {
 
       const ac = new AbortController()
       batchCtx.activeControllers.add(ac)
-      abortRef.current = ac
+      activeAbortControllersRef.current.add(ac)
 
       try {
         let imageDataUrl: string
@@ -426,6 +495,7 @@ export default function App() {
         throw e
       } finally {
         batchCtx.activeControllers.delete(ac)
+        activeAbortControllersRef.current.delete(ac)
       }
     }
 
@@ -449,9 +519,11 @@ export default function App() {
         }))
 
         setJobs((prev) => {
-          if (batchStart === 0) return batchJobs
-          const finished = prev.filter((j) => j.status === 'done' || j.status === 'error')
-          return [...finished, ...batchJobs]
+          const keep = batchStart === 0 ? [] : prev.filter((j) => j.status === 'done' || j.status === 'error')
+          const drop = batchStart === 0 ? prev : prev.filter((j) => j.status !== 'done' && j.status !== 'error')
+          drop.forEach(revokeJobPreview)
+          if (batchStart === 0) prev.forEach(revokeJobPreview)
+          return [...keep, ...batchJobs]
         })
 
         const concurrency = Math.min(normalizeBatchConcurrency(normalizedConcurrency), currentBatchSize)
@@ -500,11 +572,7 @@ export default function App() {
               } else if (batchCtx.timedOut.current) {
                 markJobFinished(jobId, { status: 'error', error: BATCH_TIMEOUT_MESSAGE })
               } else if (cancelRef.current) {
-                updateJob(jobId, { status: 'queued' })
-                if (!jobSettled.has(jobId)) {
-                  jobSettled.add(jobId)
-                  setProcessedTaskCount((prev) => prev + 1)
-                }
+                markJobFinished(jobId, { status: 'error', error: CANCEL_MESSAGE })
               } else {
                 markJobFinished(jobId, { status: 'error', error: '任务已中断' })
               }
@@ -542,7 +610,7 @@ export default function App() {
         }
       }
     } finally {
-      abortRef.current = null
+      activeAbortControllersRef.current.clear()
       runInProgressRef.current = false
       setIsRunning(false)
     }
@@ -562,6 +630,7 @@ export default function App() {
     useCustomSize,
     prefix,
     concurrencyInput,
+    CANCEL_MESSAGE,
     updateJob,
     generateOutputName,
     saveJobToFolder,
@@ -581,11 +650,17 @@ export default function App() {
   const removeJob = useCallback((jobId: string) => {
     if (isRunning) return
     setJobs((prev) => {
-      const job = prev.find(j => j.id === jobId)
-      if (job?.previewObjectUrl) {
-        try { URL.revokeObjectURL(job.previewObjectUrl) } catch {}
-      }
-      return prev.filter(j => j.id !== jobId)
+      const job = prev.find((j) => j.id === jobId)
+      if (job) revokeJobPreview(job)
+      return prev.filter((j) => j.id !== jobId)
+    })
+  }, [isRunning])
+
+  const clearAllJobs = useCallback(() => {
+    if (isRunning) return
+    setJobs((prev) => {
+      prev.forEach(revokeJobPreview)
+      return []
     })
   }, [isRunning])
 
@@ -615,7 +690,7 @@ export default function App() {
     }
     const dir = saveFolderHandleRef.current
     if (!dir) {
-      alert('请先在左侧「保存位置」中选择文件夹。')
+      alert('请先在「开始处理」区域选择保存文件夹。')
       return
     }
     try {
@@ -664,9 +739,16 @@ export default function App() {
 
   const canStart = Boolean(
     apiToken.trim() &&
-      ((enableOutpaint || enableVariation) && inputFiles.length > 0) ||
-      (enableText2Img && excelPrompts.length > 0),
+      (((enableOutpaint || enableVariation) && inputFiles.length > 0) ||
+        (enableText2Img && excelPrompts.length > 0)),
   )
+
+  const enabledFeatureCount =
+    Number(enableOutpaint && inputFiles.length > 0) +
+    Number(enableVariation && inputFiles.length > 0) +
+    Number(enableText2Img && excelPrompts.length > 0)
+
+  const totalBatchCount = totalTaskCount > 0 ? Math.ceil(totalTaskCount / BATCH_WINDOW_SIZE) : 0
 
   return (
     <div className="app">
@@ -693,6 +775,7 @@ export default function App() {
                 placeholder="sk-..."
                 autoComplete="off"
               />
+              <span className="token-privacy-hint">密钥仅保存在本机浏览器，请勿在公共电脑使用。</span>
             </div>
             <div className="field">
               <label htmlFor="base">接口地址</label>
@@ -844,7 +927,11 @@ export default function App() {
                       min="1"
                       max="10"
                       value={variationCount}
-                      onChange={(e) => setVariationCount(parseInt(e.target.value, 10))}
+                      onChange={(e) => {
+                        const v = parseInt(e.target.value, 10)
+                        if (!Number.isFinite(v)) return
+                        setVariationCount(Math.max(1, Math.min(10, v)))
+                      }}
                     />
                   </div>
                 )}
@@ -862,8 +949,27 @@ export default function App() {
                 <h2>📁 输入图片</h2>
               </div>
               <div className="settings-card-body">
+                <div
+                  className={`input-dropzone${isInputDragOver ? ' is-dragover' : ''}`}
+                  onDragOver={(e) => {
+                    e.preventDefault()
+                    if (!isRunning) setIsInputDragOver(true)
+                  }}
+                  onDragLeave={(e) => {
+                    e.preventDefault()
+                    if (e.currentTarget.contains(e.relatedTarget as Node)) return
+                    setIsInputDragOver(false)
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault()
+                    setIsInputDragOver(false)
+                    if (isRunning) return
+                    const files = getImageFilesFromDataTransfer(e.dataTransfer)
+                    if (files.length) handleFilesSelected(files)
+                  }}
+                >
                 <p className="dropzone-sub" style={{ margin: 0 }}>
-                  上传图片或选择文件夹，支持多选 · 粘贴 (Ctrl/Cmd + V)
+                  上传图片、拖拽到此处，或粘贴 (Ctrl/Cmd + V) · 支持多选
                 </p>
 
                 <div className="excel-upload-row">
@@ -902,7 +1008,10 @@ export default function App() {
                 {inputFiles.length > 0 && (
                   <div className="input-files-list">
                     <div className="input-files-header">
-                      <span>已添加 {inputFiles.length} 张图片（显示前 20 张）</span>
+                      <span>
+                        已添加 {inputFiles.length} 张图片（预览前 20 张
+                        {inputFiles.length > 20 ? `，另有 ${inputFiles.length - 20} 张未展示` : ''}）
+                      </span>
                       <button
                         type="button"
                         className="btn btn-ghost"
@@ -914,9 +1023,9 @@ export default function App() {
                     </div>
                     <div className="input-files-grid">
                       {inputFiles.slice(0, 20).map((file, index) => (
-                        <div key={`${file.name}-${index}`} className="input-file-item">
+                        <div key={`${file.name}-${file.size}-${file.lastModified}-${index}`} className="input-file-item">
                           <img
-                            src={URL.createObjectURL(file)}
+                            src={inputPreviewUrls[index]}
                             alt={file.name}
                             title={file.name}
                           />
@@ -933,6 +1042,7 @@ export default function App() {
                     </div>
                   </div>
                 )}
+                </div>
               </div>
             </div>
           )}
@@ -1000,7 +1110,9 @@ export default function App() {
                               {excelPreview.slice(0, 5).map((row, i) => (
                                 <tr key={i}>
                                   {row.map((cell, j) => (
-                                    <td key={j} title={cell || ''}>{cell}</td>
+                                    <td key={j} title={cell != null ? String(cell) : ''}>
+                                      {cell != null ? String(cell) : ''}
+                                    </td>
                                   ))}
                                 </tr>
                               ))}
@@ -1044,6 +1156,15 @@ export default function App() {
           {/* 执行按钮 */}
           <div className="action-card">
             <h3>🚀 开始处理</h3>
+
+            <p className="batch-hint">
+              每批最多 {BATCH_WINDOW_SIZE} 张，单批最长 3 分钟；超时未完成的会自动跳过并进入下一批。
+            </p>
+            {enabledFeatureCount > 1 ? (
+              <p className="task-order-hint">
+                多任务同时开启时按顺序执行：扩充 → 裂变 → Excel 文生图。
+              </p>
+            ) : null}
 
             {supportsSaveToFolder() ? (
               <div className="action-save-folder">
@@ -1122,7 +1243,7 @@ export default function App() {
                   className="btn btn-secondary"
                   disabled={isRunning || jobStats.done === 0 || !saveFolderName}
                   onClick={() => void onSaveDoneToFolder()}
-                  title={saveFolderName ? undefined : '请先在左侧选择保存文件夹'}
+                  title={saveFolderName ? undefined : '请先在下方「开始处理」区域选择保存文件夹'}
                 >
                   保存已完成到文件夹 ({jobStats.done})
                 </button>
@@ -1138,18 +1259,18 @@ export default function App() {
             ) : null}
 
             {isRunning && totalTaskCount > 0 ? (
-              <>
-                <p className="progress-line">
-                  进度：已完成 {jobStats.done} / {totalTaskCount}
-                  {jobStats.running > 0 ? ` · 进行中 ${jobStats.running}` : ''}
-                  {jobStats.error > 0 ? ` · 失败 ${jobStats.error}` : ''}
-                </p>
-                {totalTaskCount > BATCH_WINDOW_SIZE ? (
-                  <p className="progress-line">
-                    已处理 {processedTaskCount} / {totalTaskCount}（共 {Math.ceil(totalTaskCount / BATCH_WINDOW_SIZE)} 批）
-                  </p>
-                ) : null}
-              </>
+              <p className="progress-line">
+                进度：已处理 {processedTaskCount} / {totalTaskCount}
+                {jobStats.done > 0 ? ` · 成功 ${jobStats.done}` : ''}
+                {jobStats.error > 0 ? ` · 失败 ${jobStats.error}` : ''}
+                {jobStats.running > 0 ? ` · 进行中 ${jobStats.running}` : ''}
+                {totalBatchCount > 1 ? ` · 共 ${totalBatchCount} 批` : ''}
+              </p>
+            ) : null}
+            {!isRunning && jobs.length > 0 ? (
+              <p className="results-summary">
+                结果汇总：共 {jobs.length} 项 · 成功 {jobStats.done} · 失败 {jobStats.error}
+              </p>
             ) : null}
           </div>
 
@@ -1158,22 +1279,27 @@ export default function App() {
             <div className="results-section">
               <div className="results-header">
                 <h2 className="results-heading">生成结果</h2>
+                <span className="results-summary">
+                  成功 {jobStats.done} · 失败 {jobStats.error}
+                </span>
                 <button
                   type="button"
                   className="btn btn-ghost"
                   disabled={isRunning}
-                  onClick={() => setJobs([])}
+                  onClick={clearAllJobs}
                   title="清空所有生成的图片"
                 >
                   全部清空
                 </button>
               </div>
               <div className="job-grid">
-                {displayJobs.map((job) => (
+                {displayJobs.map((job) => {
+                  const jobTitle = job.file?.name ?? job.prompt ?? '文生图'
+                  return (
                   <article key={job.id} className="job-card">
                     <div className="job-card-head">
-                      <span className="job-name" title={job.file?.name ?? job.prompt ?? '文生图'}>
-                        {job.file?.name ?? job.prompt?.slice(0, 15) ?? '文生图'}
+                      <span className="job-name" title={jobTitle}>
+                        {truncateLabel(jobTitle, 24)}
                       </span>
                       <span className={`status status-${job.status}`}>
                         {job.status === 'queued' ? '等待' : job.status === 'running' ? '生成中' : job.status === 'done' ? '完成' : '失败'}
@@ -1190,7 +1316,7 @@ export default function App() {
                     </div>
                     <div className="job-meta">
                       <span className="job-type">
-                        {job.jobType === 'outpaint' ? ' 扩充' : job.jobType === 'variation' ? '✨ 裂变' : ' 文生图'}
+                        {job.jobType === 'outpaint' ? '🖼️ 扩充' : job.jobType === 'variation' ? '✨ 裂变' : '📝 文生图'}
                       </span>
                       {job.outputName && <span className="job-output">{job.outputName}</span>}
                     </div>
@@ -1224,7 +1350,8 @@ export default function App() {
                       </button>
                     </div>
                   </article>
-                ))}
+                  )
+                })}
               </div>
             </div>
           )}

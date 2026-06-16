@@ -24,6 +24,15 @@ export function parseSize(sizeStr: string): { width: number; height: number } {
   return { width: w, height: h }
 }
 
+/** 校验 API 尺寸字符串，格式为 宽x高 */
+export function isValidSizeFormat(sizeStr: string): boolean {
+  const m = /^(\d+)x(\d+)$/i.exec(sizeStr.trim())
+  if (!m) return false
+  const w = parseInt(m[1], 10)
+  const h = parseInt(m[2], 10)
+  return Number.isFinite(w) && Number.isFinite(h) && w >= 64 && h <= 8192 && h >= 64 && w <= 8192
+}
+
 /**
  * 计算扩充后的目标尺寸
  * @param originalWidth 原始宽度

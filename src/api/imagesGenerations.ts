@@ -20,7 +20,14 @@ function pickString(obj: Record<string, unknown>, keys: string[]): string | unde
 function extractErrorMessage(json: unknown): string | undefined {
   if (!json || typeof json !== 'object') return
   const o = json as Record<string, unknown>
-  return pickString(o, ['message', 'error', 'msg', 'detail'])
+  for (const k of ['message', 'error', 'msg', 'detail']) {
+    const v = o[k]
+    if (typeof v === 'string' && v.length > 0) return v
+    if (v && typeof v === 'object') {
+      const nested = v as Record<string, unknown>
+      if (typeof nested.message === 'string' && nested.message.length > 0) return nested.message
+    }
+  }
 }
 
 /**
@@ -72,9 +79,7 @@ export async function parseGenerationImage(json: unknown): Promise<string> {
     return s.startsWith('data:') ? s : `data:image/png;base64,${s}`
   }
 
-  throw new Error(
-    '无法解析图片字段：请展开「原始响应」查看结构。常见字段为 data[0].url 或 data[0].b64_json。',
-  )
+  throw new Error('无法解析图片字段，常见字段为 data[0].url 或 data[0].b64_json。')
 }
 
 async function fetchRemoteAsDataURL(url: string): Promise<string> {
