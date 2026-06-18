@@ -62,6 +62,6 @@ export async function postImagesEdits(
     throw new Error(`HTTP ${res.status}: ${hint}`)
   }
 
-  const imageDataUrl = await parseGenerationImage(json)
+  const imageDataUrl = await parseGenerationImage(json, signal)
   return { imageDataUrl, rawJson: json }
 }

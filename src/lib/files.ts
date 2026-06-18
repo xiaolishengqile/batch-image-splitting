@@ -18,12 +18,20 @@ export async function readFileAsDataURL(file: File): Promise<string> {
 }
 
 /**
+ * 判断文件是否是常见图片。部分文件夹导入场景下浏览器可能不给 MIME。
+ */
+export function isImageFile(file: File): boolean {
+  if (/^image\//.test(file.type)) return true
+  return /\.(png|jpe?g|webp|gif|bmp|avif|heic|heif|tiff?)$/i.test(file.name)
+}
+
+/**
  * 从 DataTransfer 对象中提取图片文件
  */
 export function getImageFilesFromDataTransfer(dt: DataTransfer): File[] {
   const files = dt.files
   if (!files || files.length === 0) return []
-  return Array.from(files).filter((f) => /^image\//.test(f.type))
+  return Array.from(files).filter(isImageFile)
 }
 
 /**
@@ -44,6 +52,64 @@ export async function pickSaveDirectoryHandle(): Promise<FileSystemDirectoryHand
 }
 
 /**
+ * 从 Blob MIME 推断文件扩展名
+ */
+export function extensionFromBlob(blob: Blob): string {
+  const type = blob.type
+  if (type.includes('jpeg') || type.includes('jpg')) return 'jpg'
+  if (type.includes('webp')) return 'webp'
+  return 'png'
+}
+
+/**
+ * 从 Data URL 推断文件扩展名
+ */
+export function extensionFromDataUrl(dataUrl: string): string {
+  if (dataUrl.includes('image/jpeg') || dataUrl.includes('image/jpg')) return 'jpg'
+  if (dataUrl.includes('image/webp')) return 'webp'
+  return 'png'
+}
+
+function sanitizeFilename(filename: string): string {
+  let name = filename.trim() || 'result.png'
+  name = name.replace(/[/\\]/g, '_').replace(/\.\./g, '_')
+  if (!/\.(png|jpe?g|webp)$/i.test(name)) {
+    name = `${name.replace(/\.+$/, '')}.png`
+  }
+  return name
+}
+
+function dedupeFilename(filename: string, usedNames: Set<string>): string {
+  let candidate = sanitizeFilename(filename)
+  let n = 1
+  while (usedNames.has(candidate.toLowerCase())) {
+    const match = candidate.match(/^(.*?)(\.(png|jpe?g|webp))$/i)
+    const stem = match?.[1] ?? candidate
+    const ext = match?.[2] ?? '.png'
+    candidate = `${stem}_${n}${ext}`
+    n += 1
+  }
+  usedNames.add(candidate.toLowerCase())
+  return candidate
+}
+
+/**
+ * 将 Blob 写入指定目录
+ */
+export async function writeBlobToDirectory(
+  dirHandle: FileSystemDirectoryHandle,
+  blob: Blob,
+  filename: string,
+  usedNames: Set<string>,
+): Promise<void> {
+  const candidate = dedupeFilename(filename, usedNames)
+  const fileHandle = await dirHandle.getFileHandle(candidate, { create: true })
+  const writable = await fileHandle.createWritable()
+  await writable.write(blob)
+  await writable.close()
+}
+
+/**
  * 将 Data URL 写入指定目录
  */
 export async function writeImageToDirectory(
@@ -52,26 +118,7 @@ export async function writeImageToDirectory(
   filename: string,
   usedNames: Set<string>,
 ): Promise<void> {
-  // 文件名去重
-  let name = filename.trim() || 'result.png'
-  name = name.replace(/[/\\]/g, '_').replace(/\.\./g, '_')
-  if (!/\.(png|jpe?g|webp)$/i.test(name)) name = `${name.replace(/\.+$/, '')}.png`
-  let candidate = name
-  let n = 1
-  while (usedNames.has(candidate.toLowerCase())) {
-    const stem = candidate.replace(/\.(png|jpe?g|webp)$/i, '')
-    candidate = `${stem}_${n}.png`
-    n += 1
-  }
-  usedNames.add(candidate.toLowerCase())
-
-  // 获取或创建文件
-  const fileHandle = await dirHandle.getFileHandle(candidate, { create: true })
-  const writable = await fileHandle.createWritable()
-
-  // Data URL 转 Blob
   const response = await fetch(dataUrl)
   const blob = await response.blob()
-  await writable.write(blob)
-  await writable.close()
+  await writeBlobToDirectory(dirHandle, blob, filename, usedNames)
 }

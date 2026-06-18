@@ -34,7 +34,7 @@ function extractErrorMessage(json: unknown): string | undefined {
  * 从网关返回 JSON 中解析出可在 <img src> 使用的地址或 data URL。
  * 兼容 OpenAI 风格 data[]、单字段 image / b64_json 等。
  */
-export async function parseGenerationImage(json: unknown): Promise<string> {
+export async function parseGenerationImage(json: unknown, signal?: AbortSignal): Promise<string> {
   if (!json || typeof json !== 'object') {
     throw new Error('响应体不是 JSON 对象')
   }
@@ -42,7 +42,7 @@ export async function parseGenerationImage(json: unknown): Promise<string> {
 
   if (Array.isArray(root.image) && root.image.length > 0 && typeof root.image[0] === 'string') {
     const s = root.image[0]
-    if (s.startsWith('http://') || s.startsWith('https://')) return fetchRemoteAsDataURL(s)
+    if (s.startsWith('http://') || s.startsWith('https://')) return fetchRemoteAsDataURL(s, signal)
     if (s.startsWith('data:')) return s
     return `data:image/png;base64,${s}`
   }
@@ -50,7 +50,7 @@ export async function parseGenerationImage(json: unknown): Promise<string> {
   const direct = pickString(root, ['b64_json', 'image_base64']) ?? (typeof root.image === 'string' ? root.image : undefined)
   if (direct) {
     if (direct.startsWith('http://') || direct.startsWith('https://')) {
-      return fetchRemoteAsDataURL(direct)
+      return fetchRemoteAsDataURL(direct, signal)
     }
     if (direct.startsWith('data:')) return direct
     return `data:image/png;base64,${direct}`
@@ -63,7 +63,7 @@ export async function parseGenerationImage(json: unknown): Promise<string> {
       const item = first as Record<string, unknown>
       const url = item.url
       if (typeof url === 'string' && (url.startsWith('http://') || url.startsWith('https://'))) {
-        return fetchRemoteAsDataURL(url)
+        return fetchRemoteAsDataURL(url, signal)
       }
       const b64 = item.b64_json
       if (typeof b64 === 'string') {
@@ -75,15 +75,15 @@ export async function parseGenerationImage(json: unknown): Promise<string> {
   const images = root.images
   if (Array.isArray(images) && typeof images[0] === 'string') {
     const s = images[0] as string
-    if (s.startsWith('http')) return fetchRemoteAsDataURL(s)
+    if (s.startsWith('http')) return fetchRemoteAsDataURL(s, signal)
     return s.startsWith('data:') ? s : `data:image/png;base64,${s}`
   }
 
   throw new Error('无法解析图片字段，常见字段为 data[0].url 或 data[0].b64_json。')
 }
 
-async function fetchRemoteAsDataURL(url: string): Promise<string> {
-  const res = await fetch(url)
+async function fetchRemoteAsDataURL(url: string, signal?: AbortSignal): Promise<string> {
+  const res = await fetch(url, { signal })
   if (!res.ok) {
     throw new Error(`下载生成图失败 HTTP ${res.status}`)
   }
@@ -123,6 +123,6 @@ export async function postImagesGenerations(
     throw new Error(`HTTP ${res.status}: ${hint}`)
   }
 
-  const imageDataUrl = await parseGenerationImage(json)
+  const imageDataUrl = await parseGenerationImage(json, signal)
   return { imageDataUrl, rawJson: json }
 }

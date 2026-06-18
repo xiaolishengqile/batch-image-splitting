@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type InputHTMLAttributes, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import JSZip from 'jszip'
 import { saveAs } from 'file-saver'
 import { read, utils } from 'xlsx'
@@ -9,6 +9,10 @@ import {
   DEFAULT_MODEL,
   DEFAULT_SIZE,
   DEFAULT_VARIATION_COUNT,
+  DEFAULT_VARIATION_SCENE,
+  DEFAULT_VARIATION_STRENGTH,
+  MAX_VARIATION_COUNT,
+  MIN_VARIATION_COUNT,
   DEFAULT_EXPANSION_SCALE,
   BATCH_WINDOW_SIZE,
   BATCH_TIMEOUT_MS,
@@ -18,9 +22,11 @@ import {
   MAX_BATCH_CONCURRENCY,
   MIN_BATCH_CONCURRENCY,
   normalizeBatchConcurrency,
+  normalizeVariationCount,
   PROMPT_OUTPAINT_CN,
   STORAGE_KEY_CONCURRENCY,
-  PROMPT_VARIATION_CN,
+  STORAGE_KEY_VARIATION_SCENE,
+  STORAGE_KEY_VARIATION_STRENGTH,
   SIZE_OPTIONS,
   STORAGE_KEY_BASE,
   STORAGE_KEY_MODEL,
@@ -29,15 +35,29 @@ import {
   STORAGE_KEY_PREFIX,
   STORAGE_KEY_EXPANSION_SCALE,
   STORAGE_KEY_VARIATION_COUNT,
+  VARIATION_SCENES,
+  VARIATION_STRENGTHS,
+  buildVariationPrompt,
+  type VariationScene,
+  type VariationStrength,
 } from './lib/constants'
 import {
   supportsSaveToFolder,
   pickSaveDirectoryHandle,
-  writeImageToDirectory,
+  writeBlobToDirectory,
+  extensionFromBlob,
   getImageFilesFromDataTransfer,
+  isImageFile,
 } from './lib/files'
 import { closestAspectLabel, is2kSizeLabel, sizeForAspect } from './lib/imageAspect'
 import { calculateExpandedSize, getImageDimensions, isValidSizeFormat } from './lib/imageSize'
+import {
+  clearResultImages,
+  deleteResultImage,
+  getResultBlob,
+  putResultImage,
+} from './lib/imageStore'
+import { ResultImage } from './components/ResultImage'
 import './App.css'
 
 type JobStatus = 'queued' | 'running' | 'done' | 'error'
@@ -49,13 +69,14 @@ interface Job {
   previewObjectUrl?: string
   status: JobStatus
   error?: string
-  resultDataUrl?: string
+  hasResult?: boolean
   addedSeq: number
   completedAt?: number
   jobType: JobType
   prompt?: string
   targetSize?: string
   outputName?: string
+  saveError?: string
 }
 
 interface ExcelPrompt {
@@ -63,16 +84,15 @@ interface ExcelPrompt {
   prompt: string
   status: JobStatus
   error?: string
-  resultDataUrl?: string
   addedSeq: number
   completedAt?: number
   outputName?: string
 }
 
-function extensionFromMime(dataUrl: string): string {
-  if (dataUrl.includes('image/jpeg') || dataUrl.includes('image/jpg')) return 'jpg'
-  if (dataUrl.includes('image/webp')) return 'webp'
-  return 'png'
+interface ImagePreviewState {
+  src: string
+  title: string
+  revokeOnClose: boolean
 }
 
 function truncateLabel(text: string, maxLen: number): string {
@@ -103,12 +123,37 @@ function revokeJobPreview(job: Job) {
   }
 }
 
+function disposeJobResources(job: Job) {
+  revokeJobPreview(job)
+  if (job.hasResult) {
+    void deleteResultImage(job.id)
+  }
+}
+
 function readInitialSizeState(): { size: string; customSize: string; useCustomSize: boolean } {
   const saved = localStorage.getItem(STORAGE_KEY_SIZE) ?? DEFAULT_SIZE
   if (SIZE_OPTIONS.includes(saved)) {
     return { size: saved, customSize: '', useCustomSize: false }
   }
   return { size: DEFAULT_SIZE, customSize: saved, useCustomSize: true }
+}
+
+function readInitialVariationScene(): VariationScene {
+  const saved = localStorage.getItem(STORAGE_KEY_VARIATION_SCENE)
+  return VARIATION_SCENES.some((option) => option.value === saved)
+    ? (saved as VariationScene)
+    : DEFAULT_VARIATION_SCENE
+}
+
+function readInitialVariationStrength(): VariationStrength {
+  const saved = localStorage.getItem(STORAGE_KEY_VARIATION_STRENGTH)
+  return VARIATION_STRENGTHS.some((option) => option.value === saved)
+    ? (saved as VariationStrength)
+    : DEFAULT_VARIATION_STRENGTH
+}
+
+const DIRECTORY_INPUT_PROPS: InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string } = {
+  webkitdirectory: '',
 }
 
 export default function App() {
@@ -136,9 +181,11 @@ export default function App() {
     () => localStorage.getItem(STORAGE_KEY_EXPANSION_SCALE) ?? DEFAULT_EXPANSION_SCALE,
   )
   const [variationCount, setVariationCount] = useState(() => {
-    const n = parseInt(localStorage.getItem(STORAGE_KEY_VARIATION_COUNT) ?? String(DEFAULT_VARIATION_COUNT), 10)
-    return Number.isFinite(n) ? Math.max(1, Math.min(10, n)) : DEFAULT_VARIATION_COUNT
+    return normalizeVariationCount(localStorage.getItem(STORAGE_KEY_VARIATION_COUNT) ?? String(DEFAULT_VARIATION_COUNT))
   })
+  const [variationCountInput, setVariationCountInput] = useState(() => String(variationCount))
+  const [variationScene, setVariationScene] = useState<VariationScene>(() => readInitialVariationScene())
+  const [variationStrength, setVariationStrength] = useState<VariationStrength>(() => readInitialVariationStrength())
 
   // 功能开关
   const [enableOutpaint, setEnableOutpaint] = useState(true)
@@ -150,6 +197,7 @@ export default function App() {
   const [inputFiles, setInputFiles] = useState<File[]>([])
   const [excelPrompts, setExcelPrompts] = useState<ExcelPrompt[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null)
   const [isRunning, setIsRunning] = useState(false)
   // 批次处理状态
   const [totalTaskCount, setTotalTaskCount] = useState<number>(0)
@@ -177,7 +225,7 @@ export default function App() {
   const runInProgressRef = useRef(false)
 
   const inputPreviewUrls = useMemo(
-    () => inputFiles.map((file) => URL.createObjectURL(file)),
+    () => inputFiles.slice(0, 20).map((file) => URL.createObjectURL(file)),
     [inputFiles],
   )
 
@@ -203,6 +251,17 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_VARIATION_COUNT, String(variationCount))
   }, [variationCount])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_VARIATION_SCENE, variationScene)
+  }, [variationScene])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_VARIATION_STRENGTH, variationStrength)
+  }, [variationStrength])
+  const commitVariationCountInput = useCallback(() => {
+    const normalized = normalizeVariationCount(variationCountInput, variationCount)
+    setVariationCount(normalized)
+    setVariationCountInput(String(normalized))
+  }, [variationCount, variationCountInput])
   const commitConcurrencyInput = useCallback(() => {
     const normalized = String(normalizeBatchConcurrency(concurrencyInput))
     setConcurrencyInput(normalized)
@@ -220,6 +279,23 @@ export default function App() {
       })
     }
   }, [inputPreviewUrls])
+
+  const closeImagePreview = useCallback(() => {
+    setImagePreview((prev) => {
+      if (prev?.revokeOnClose) {
+        URL.revokeObjectURL(prev.src)
+      }
+      return null
+    })
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (imagePreview?.revokeOnClose) {
+        URL.revokeObjectURL(imagePreview.src)
+      }
+    }
+  }, [imagePreview])
 
   const jobStats = useMemo(() => {
     let done = 0
@@ -239,7 +315,7 @@ export default function App() {
 
   // 处理输入文件
   const handleFilesSelected = useCallback((files: FileList | File[]) => {
-    const arr = Array.from(files).filter((f) => /^image\//.test(f.type))
+    const arr = Array.from(files).filter(isImageFile)
     if (arr.length === 0) return
     setInputFiles((prev) => [...prev, ...arr])
   }, [])
@@ -325,16 +401,51 @@ export default function App() {
   )
 
   // 生成完成后自动保存到文件夹
-  const saveJobToFolder = useCallback(async (job: Job, used: Set<string>) => {
-    if (!autoSaveAfterGenerate || !job.resultDataUrl || !job.outputName) return
+  const saveJobToFolder = useCallback(async (job: Job, used: Set<string>): Promise<string | null> => {
+    if (!autoSaveAfterGenerate || !job.hasResult || !job.outputName) return null
     const dir = saveFolderHandleRef.current
-    if (!dir) return
+    if (!dir) return null
     try {
-      await writeImageToDirectory(dir, job.resultDataUrl, `${job.outputName}.${extensionFromMime(job.resultDataUrl)}`, used)
+      const blob = await getResultBlob(job.id)
+      if (!blob) return '自动保存失败：结果图片不存在'
+      await writeBlobToDirectory(dir, blob, `${job.outputName}.${extensionFromBlob(blob)}`, used)
+      return null
     } catch (e) {
-      console.error('自动保存失败:', e)
+      return `自动保存失败：${e instanceof Error ? e.message : String(e)}`
     }
   }, [autoSaveAfterGenerate])
+
+  const openResultPreview = useCallback(async (job: Job) => {
+    if (!job.hasResult) return
+    const blob = await getResultBlob(job.id)
+    if (!blob) return
+    const src = URL.createObjectURL(blob)
+    setImagePreview((prev) => {
+      if (prev?.revokeOnClose) {
+        URL.revokeObjectURL(prev.src)
+      }
+      return {
+        src,
+        title: `${job.outputName ?? '生成图'} - 生成图`,
+        revokeOnClose: true,
+      }
+    })
+  }, [])
+
+  const openOriginalPreview = useCallback((job: Job) => {
+    if (!job.previewObjectUrl) return
+    const src = job.previewObjectUrl
+    setImagePreview((prev) => {
+      if (prev?.revokeOnClose) {
+        URL.revokeObjectURL(prev.src)
+      }
+      return {
+        src,
+        title: `${job.file?.name ?? job.outputName ?? '原图'} - 原图`,
+        revokeOnClose: false,
+      }
+    })
+  }, [])
 
   // 运行批处理 - 分批处理版本（每批最多 10 张，单批最长 3 分钟）
   const runBatch = useCallback(async () => {
@@ -355,6 +466,10 @@ export default function App() {
     setConcurrencyInput(normalizedConcurrency)
     localStorage.setItem(STORAGE_KEY_CONCURRENCY, normalizedConcurrency)
 
+    const normalizedVariationCount = normalizeVariationCount(variationCountInput, variationCount)
+    setVariationCount(normalizedVariationCount)
+    setVariationCountInput(String(normalizedVariationCount))
+
     // 快照当前输入，避免运行中 state 变化导致重复或遗漏
     const filesSnapshot = inputFiles
     const promptsSnapshot = excelPrompts
@@ -373,27 +488,45 @@ export default function App() {
       promptIndex?: number
       jobType: JobType
       variationIndex?: number
+      outputName: string
     }
 
     const taskQueue: TaskItem[] = []
+    let outputSeq = 1
 
     if (enableOutpaint && filesSnapshot.length > 0) {
       filesSnapshot.forEach((file, index) => {
-        taskQueue.push({ file, fileIndex: index, jobType: 'outpaint' })
+        taskQueue.push({
+          file,
+          fileIndex: index,
+          jobType: 'outpaint',
+          outputName: generateOutputName(prefix, outputSeq++),
+        })
       })
     }
 
     if (enableVariation && filesSnapshot.length > 0) {
       filesSnapshot.forEach((file, index) => {
-        for (let i = 0; i < variationCount; i++) {
-          taskQueue.push({ file, fileIndex: index, jobType: 'variation', variationIndex: i })
+        for (let i = 0; i < normalizedVariationCount; i++) {
+          taskQueue.push({
+            file,
+            fileIndex: index,
+            jobType: 'variation',
+            variationIndex: i,
+            outputName: generateOutputName(prefix, outputSeq++),
+          })
         }
       })
     }
 
     if (enableText2Img && promptsSnapshot.length > 0) {
       promptsSnapshot.forEach((p, index) => {
-        taskQueue.push({ prompt: p.prompt, promptIndex: index, jobType: 'text2img' })
+        taskQueue.push({
+          prompt: p.prompt,
+          promptIndex: index,
+          jobType: 'text2img',
+          outputName: generateOutputName(prefix, outputSeq++),
+        })
       })
     }
 
@@ -415,8 +548,6 @@ export default function App() {
     cancelRef.current = false
     setIsRunning(true)
 
-    let outputSeq = 1
-
     const resolveEditParams = async (
       file: File,
       jobType: 'outpaint' | 'variation',
@@ -433,7 +564,7 @@ export default function App() {
       }
       const aspect = closestAspectLabel(width, height)
       return {
-        prompt: PROMPT_VARIATION_CN,
+        prompt: buildVariationPrompt(variationScene, variationStrength),
         size: sizeForAspect(aspect, baseSize, use2kOutput),
         aspect_ratio: aspect,
       }
@@ -442,7 +573,7 @@ export default function App() {
     const runOneTask = async (
       task: TaskItem,
       batchCtx: { timedOut: { current: boolean }; activeControllers: Set<AbortController> },
-    ): Promise<{ outputName: string; resultDataUrl: string } | null> => {
+    ): Promise<{ imageDataUrl: string } | null> => {
       if (cancelRef.current || batchCtx.timedOut.current) return null
 
       const ac = new AbortController()
@@ -486,8 +617,7 @@ export default function App() {
 
         if (batchCtx.timedOut.current) return null
 
-        const outputName = generateOutputName(prefix, outputSeq++)
-        return { outputName, resultDataUrl: imageDataUrl }
+        return { imageDataUrl }
       } catch (e) {
         if (cancelRef.current || batchCtx.timedOut.current || (e instanceof DOMException && e.name === 'AbortError')) {
           return null
@@ -515,14 +645,15 @@ export default function App() {
           status: 'queued' as JobStatus,
           jobType: task.jobType,
           prompt: task.prompt,
+          outputName: task.outputName,
           addedSeq: addedSeqRef.current++,
         }))
 
         setJobs((prev) => {
           const keep = batchStart === 0 ? [] : prev.filter((j) => j.status === 'done' || j.status === 'error')
           const drop = batchStart === 0 ? prev : prev.filter((j) => j.status !== 'done' && j.status !== 'error')
-          drop.forEach(revokeJobPreview)
-          if (batchStart === 0) prev.forEach(revokeJobPreview)
+          drop.forEach(disposeJobResources)
+          if (batchStart === 0) prev.forEach(disposeJobResources)
           return [...keep, ...batchJobs]
         })
 
@@ -555,20 +686,35 @@ export default function App() {
             try {
               const result = await runOneTask(task, batchCtx)
               if (result) {
+                if (batchCtx.timedOut.current || cancelRef.current) {
+                  markJobFinished(jobId, {
+                    status: 'error',
+                    error: batchCtx.timedOut.current ? BATCH_TIMEOUT_MESSAGE : CANCEL_MESSAGE,
+                  })
+                  continue
+                }
+                try {
+                  await putResultImage(jobId, result.imageDataUrl)
+                } catch {
+                  markJobFinished(jobId, { status: 'error', error: '结果保存失败' })
+                  continue
+                }
+                const finishedJob: Job = {
+                  ...batchJobs[myTask],
+                  status: 'done',
+                  hasResult: true,
+                  completedAt: Date.now(),
+                }
                 markJobFinished(jobId, {
                   status: 'done',
-                  resultDataUrl: result.resultDataUrl,
-                  completedAt: Date.now(),
-                  outputName: result.outputName,
+                  hasResult: true,
+                  completedAt: finishedJob.completedAt,
+                  outputName: finishedJob.outputName,
                 })
-                void saveJobToFolder(
-                  {
-                    ...batchJobs[myTask],
-                    resultDataUrl: result.resultDataUrl,
-                    outputName: result.outputName,
-                  },
-                  autoSaveUsedNamesRef.current,
-                )
+                const saveError = await saveJobToFolder(finishedJob, autoSaveUsedNamesRef.current)
+                if (saveError) {
+                  updateJob(jobId, { saveError })
+                }
               } else if (batchCtx.timedOut.current) {
                 markJobFinished(jobId, { status: 'error', error: BATCH_TIMEOUT_MESSAGE })
               } else if (cancelRef.current) {
@@ -624,26 +770,31 @@ export default function App() {
     excelPrompts,
     expansionScale,
     variationCount,
+    variationScene,
+    variationStrength,
     model,
     size,
     customSize,
     useCustomSize,
     prefix,
     concurrencyInput,
-    CANCEL_MESSAGE,
+    variationCountInput,
     updateJob,
     generateOutputName,
     saveJobToFolder,
     autoSaveAfterGenerate,
   ])
 
-  const downloadOne = useCallback((job: Job) => {
-    if (!job.resultDataUrl) return
+  const downloadOne = useCallback(async (job: Job) => {
+    if (!job.hasResult) return
+    const blob = await getResultBlob(job.id)
+    if (!blob) return
+    const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
-    a.href = job.resultDataUrl
-    const ext = extensionFromMime(job.resultDataUrl)
-    a.download = `${job.outputName ?? 'image'}.${ext}`
+    a.href = url
+    a.download = `${job.outputName ?? 'image'}.${extensionFromBlob(blob)}`
     a.click()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }, [])
 
   // 删除单个 job
@@ -651,7 +802,7 @@ export default function App() {
     if (isRunning) return
     setJobs((prev) => {
       const job = prev.find((j) => j.id === jobId)
-      if (job) revokeJobPreview(job)
+      if (job) disposeJobResources(job)
       return prev.filter((j) => j.id !== jobId)
     })
   }, [isRunning])
@@ -659,7 +810,8 @@ export default function App() {
   const clearAllJobs = useCallback(() => {
     if (isRunning) return
     setJobs((prev) => {
-      prev.forEach(revokeJobPreview)
+      prev.forEach(disposeJobResources)
+      void clearResultImages()
       return []
     })
   }, [isRunning])
@@ -683,7 +835,7 @@ export default function App() {
   }, [])
 
   const onSaveDoneToFolder = useCallback(async () => {
-    const done = jobs.filter((j) => j.status === 'done' && j.resultDataUrl)
+    const done = jobs.filter((j) => j.status === 'done' && j.hasResult)
     if (done.length === 0) {
       alert('还没有生成完成的图片。')
       return
@@ -694,13 +846,17 @@ export default function App() {
       return
     }
     try {
-      const used = new Set<string>()
+      const used = new Set<string>(autoSaveUsedNamesRef.current)
+      let savedCount = 0
       for (const job of done) {
-        if (job.resultDataUrl && job.outputName) {
-          await writeImageToDirectory(dir, job.resultDataUrl, `${job.outputName}.${extensionFromMime(job.resultDataUrl)}`, used)
-        }
+        if (!job.outputName) continue
+        const blob = await getResultBlob(job.id)
+        if (!blob) continue
+        await writeBlobToDirectory(dir, blob, `${job.outputName}.${extensionFromBlob(blob)}`, used)
+        savedCount += 1
       }
-      alert(`已保存 ${done.length} 张图片到「${dir.name}」。`)
+      autoSaveUsedNamesRef.current = used
+      alert(`已保存 ${savedCount} 张图片到「${dir.name}」。`)
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return
       alert(err instanceof Error ? err.message : String(err))
@@ -708,17 +864,25 @@ export default function App() {
   }, [jobs])
 
   const downloadZip = useCallback(async () => {
-    const done = jobs.filter((j) => j.status === 'done' && j.resultDataUrl)
+    const done = jobs.filter((j) => j.status === 'done' && j.hasResult)
     if (done.length === 0) {
       alert('还没有生成完成的图片。')
       return
     }
     const zip = new JSZip()
+    const usedNames = new Set<string>()
     for (const job of done) {
-      const res = await fetch(job.resultDataUrl!)
-      const blob = await res.blob()
-      const ext = extensionFromMime(job.resultDataUrl!)
-      zip.file(`${job.outputName ?? 'image'}.${ext}`, blob)
+      const blob = await getResultBlob(job.id)
+      if (!blob) continue
+      const ext = extensionFromBlob(blob)
+      let candidate = `${job.outputName ?? 'image'}.${ext}`
+      let n = 1
+      while (usedNames.has(candidate.toLowerCase())) {
+        candidate = `${job.outputName ?? 'image'}_${n}.${ext}`
+        n += 1
+      }
+      usedNames.add(candidate.toLowerCase())
+      zip.file(candidate, blob)
     }
     const out = await zip.generateAsync({ type: 'blob' })
     saveAs(out, `批量处理结果-${new Date().toISOString().slice(0, 10)}.zip`)
@@ -920,20 +1084,57 @@ export default function App() {
                   </div>
                 )}
                 {enableVariation && (
-                  <div className="setting-row">
-                    <label>裂变数量</label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="10"
-                      value={variationCount}
-                      onChange={(e) => {
-                        const v = parseInt(e.target.value, 10)
-                        if (!Number.isFinite(v)) return
-                        setVariationCount(Math.max(1, Math.min(10, v)))
-                      }}
-                    />
-                  </div>
+                  <>
+                    <div className="setting-row">
+                      <label>裂变类型</label>
+                      <select
+                        value={variationScene}
+                        disabled={isRunning}
+                        onChange={(e) => setVariationScene(e.target.value as VariationScene)}
+                      >
+                        {VARIATION_SCENES.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="setting-row">
+                      <label>变化强度</label>
+                      <select
+                        value={variationStrength}
+                        disabled={isRunning}
+                        onChange={(e) => setVariationStrength(e.target.value as VariationStrength)}
+                      >
+                        {VARIATION_STRENGTHS.map((option) => (
+                          <option key={option.value} value={option.value}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="setting-row setting-row-with-hint">
+                      <label>裂变数量</label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="off"
+                        disabled={isRunning}
+                        value={variationCountInput}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          if (v === '' || /^\d{1,3}$/.test(v)) {
+                            setVariationCountInput(v)
+                          }
+                        }}
+                        onBlur={commitVariationCountInput}
+                        placeholder={String(DEFAULT_VARIATION_COUNT)}
+                      />
+                      <span className="setting-hint">
+                        每张原图生成 {MIN_VARIATION_COUNT}-{MAX_VARIATION_COUNT} 张裂变图
+                      </span>
+                    </div>
+                  </>
                 )}
               </div>
             </div>
@@ -992,8 +1193,7 @@ export default function App() {
                     从文件夹导入
                     <input
                       type="file"
-                      // @ts-ignore - webkitdirectory 是非标准属性
-                      webkitdirectory=""
+                      {...DIRECTORY_INPUT_PROPS}
                       disabled={isRunning}
                       onChange={(e) => {
                         if (e.target.files?.length) {
@@ -1320,7 +1520,7 @@ export default function App() {
                       </span>
                       {job.outputName && <span className="job-output">{job.outputName}</span>}
                     </div>
-                    <div className="job-images">
+                    <div className={`job-images${job.previewObjectUrl ? '' : ' job-images-single'}`}>
                       {job.previewObjectUrl && (
                         <figure>
                           <img src={job.previewObjectUrl} alt="原图" />
@@ -1328,8 +1528,12 @@ export default function App() {
                         </figure>
                       )}
                       <figure>
-                        {job.resultDataUrl ? (
-                          <img src={job.resultDataUrl} alt="生成图" />
+                        {job.hasResult ? (
+                          <ResultImage
+                            imageId={job.id}
+                            alt="生成图"
+                            placeholder={job.status === 'running' ? '生成中…' : '加载中…'}
+                          />
                         ) : (
                           <span className="result-placeholder">
                             {job.status === 'running' ? '生成中…' : job.status === 'error' ? '失败' : '等待'}
@@ -1339,12 +1543,30 @@ export default function App() {
                       </figure>
                     </div>
                     {job.error ? <div className="job-error">{job.error}</div> : null}
+                    {job.saveError ? <div className="job-save-error">{job.saveError}</div> : null}
                     <div className="job-actions">
                       <button
                         type="button"
                         className="btn btn-secondary"
-                        disabled={!job.resultDataUrl}
-                        onClick={() => downloadOne(job)}
+                        disabled={!job.hasResult}
+                        onClick={() => void openResultPreview(job)}
+                      >
+                        查看
+                      </button>
+                      {job.previewObjectUrl ? (
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() => openOriginalPreview(job)}
+                        >
+                          原图
+                        </button>
+                      ) : null}
+                      <button
+                        type="button"
+                        className="btn btn-secondary"
+                        disabled={!job.hasResult}
+                        onClick={() => void downloadOne(job)}
                       >
                         下载
                       </button>
@@ -1357,6 +1579,32 @@ export default function App() {
           )}
         </main>
       </div>
+      {imagePreview ? (
+        <div
+          className="image-preview-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-label={imagePreview.title}
+          onClick={closeImagePreview}
+        >
+          <div className="image-preview-dialog" onClick={(e) => e.stopPropagation()}>
+            <div className="image-preview-head">
+              <span title={imagePreview.title}>{imagePreview.title}</span>
+              <button
+                type="button"
+                className="btn btn-ghost image-preview-close"
+                onClick={closeImagePreview}
+                aria-label="关闭预览"
+              >
+                ×
+              </button>
+            </div>
+            <div className="image-preview-body">
+              <img src={imagePreview.src} alt={imagePreview.title} />
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }
