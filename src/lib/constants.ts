@@ -20,12 +20,11 @@ export function normalizeBatchConcurrency(
   return Math.max(MIN_BATCH_CONCURRENCY, Math.min(MAX_BATCH_CONCURRENCY, n))
 }
 
-/** 单批次最长等待时间（毫秒），超时后未完成的图片跳过并进入下一批 */
-export const BATCH_TIMEOUT_MS = 3 * 60 * 1000
-
-export const BATCH_TIMEOUT_MESSAGE = '批次超时（3 分钟），已跳过继续下一批'
-
 export const CANCEL_MESSAGE = '已取消'
+
+/** 单任务失败后的自动重试次数 */
+export const DEFAULT_TASK_RETRY_COUNT = 2
+export const TASK_RETRY_DELAY_MS = 1500
 
 export const DEFAULT_MODEL = 'gpt-image-2'
 
@@ -41,6 +40,17 @@ export const PROMPT_OUTPAINT_CN = `【图片扩充】智能扩展图片画布，
 填充的新内容必须与原图的风格、光线、颜色、构图保持一致。
 扩充后的效果应该看起来自然无缝，就像原始照片只是被裁剪了一样。
 不要改变原图主体的大小和位置，只扩展周围背景和边缘内容。`
+
+/** 产品图案提取提示词（中文） */
+export const PROMPT_PATTERN_EXTRACT_CN = `【图案提取 / 清晰化】
+请从输入的商品图、样机图或实拍图中，提取商品表面的印花图案，并输出为一张独立的高清平面设计图。
+
+核心要求：
+1. 只保留商品上的图案内容，去掉衣服、手机壳、挂画边框、手、背景、阴影、褶皱、透视变形和拍摄环境。
+2. 将图案尽量还原为正面、平整、完整的二维印刷素材，适合再次用于 POD 商品或后续裂变生成。
+3. 提高清晰度、边缘质量和细节完整度，但不要改变图案主题、主要元素、配色和风格。
+4. 不要输出产品样机、衣服、手机壳、实拍场景、对比图、水印、文字说明或边框截图。
+5. 如果原图中有明显遮挡或折皱，可合理补全缺失区域，让结果看起来像原始高清印花源文件。`
 
 export const VARIATION_SCENES = [
   { value: 'default', label: '默认' },
@@ -108,16 +118,31 @@ export const STORAGE_KEY_MODEL = 'batch_image_model'
 export const STORAGE_KEY_BASE = 'batch_image_api_base'
 export const STORAGE_KEY_SIZE = 'batch_image_size'
 export const STORAGE_KEY_PREFIX = 'batch_image_prefix'
+export const STORAGE_KEY_START_NUMBER = 'batch_image_start_number'
 export const STORAGE_KEY_EXPANSION_SCALE = 'batch_image_expansion_scale'
 export const STORAGE_KEY_VARIATION_COUNT = 'batch_image_variation_count'
 export const STORAGE_KEY_VARIATION_SCENE = 'batch_image_variation_scene'
 export const STORAGE_KEY_VARIATION_STRENGTH = 'batch_image_variation_strength'
+export const STORAGE_KEY_RESOLUTION_MODE = 'batch_image_resolution_mode'
+export const STORAGE_KEY_TARGET_ASPECT = 'batch_image_target_aspect'
 
 /** 默认尺寸 */
 export const DEFAULT_SIZE = '1024x1024'
 
 /** API 支持的宽高比标签 */
-export const ASPECT_OPTIONS = ['1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9'] as const
+export const ASPECT_OPTIONS = ['1:1', '1:2', '2:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9'] as const
+
+export const DEFAULT_TARGET_ASPECT = '1:1'
+
+export const RESOLUTION_MODES = [
+  { value: 'scale', label: '按原图倍数' },
+  { value: 'aspect', label: '按比例' },
+  { value: 'custom', label: '自定义' },
+] as const
+
+export type ResolutionMode = (typeof RESOLUTION_MODES)[number]['value']
+
+export const DEFAULT_RESOLUTION_MODE: ResolutionMode = 'aspect'
 
 /** 尺寸选项 */
 export const SIZE_OPTIONS = [
@@ -136,6 +161,11 @@ export const MIN_VARIATION_COUNT = 1
 export const MAX_VARIATION_COUNT = 10
 export const DEFAULT_VARIATION_COUNT = 4
 
+/** 输出起始编号 */
+export const MIN_START_NUMBER = 1
+export const MAX_START_NUMBER = 999999
+export const DEFAULT_START_NUMBER = 1
+
 /** 将裂变数量输入规范为合法整数 */
 export function normalizeVariationCount(
   raw: string | number,
@@ -144,6 +174,16 @@ export function normalizeVariationCount(
   const n = typeof raw === 'number' ? raw : parseInt(raw.trim(), 10)
   if (!Number.isFinite(n)) return fallback
   return Math.max(MIN_VARIATION_COUNT, Math.min(MAX_VARIATION_COUNT, n))
+}
+
+/** 将起始编号输入规范为合法整数 */
+export function normalizeStartNumber(
+  raw: string | number,
+  fallback: number = DEFAULT_START_NUMBER,
+): number {
+  const n = typeof raw === 'number' ? raw : parseInt(raw.trim(), 10)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(MIN_START_NUMBER, Math.min(MAX_START_NUMBER, n))
 }
 
 /** 默认扩充比例 */

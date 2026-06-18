@@ -11,20 +11,29 @@ import {
   DEFAULT_VARIATION_COUNT,
   DEFAULT_VARIATION_SCENE,
   DEFAULT_VARIATION_STRENGTH,
+  DEFAULT_RESOLUTION_MODE,
+  DEFAULT_START_NUMBER,
+  DEFAULT_TARGET_ASPECT,
+  DEFAULT_TASK_RETRY_COUNT,
   MAX_VARIATION_COUNT,
   MIN_VARIATION_COUNT,
   DEFAULT_EXPANSION_SCALE,
   BATCH_WINDOW_SIZE,
-  BATCH_TIMEOUT_MS,
-  BATCH_TIMEOUT_MESSAGE,
   CANCEL_MESSAGE,
   DEFAULT_BATCH_CONCURRENCY,
   MAX_BATCH_CONCURRENCY,
   MIN_BATCH_CONCURRENCY,
+  RESOLUTION_MODES,
   normalizeBatchConcurrency,
+  normalizeStartNumber,
   normalizeVariationCount,
   PROMPT_OUTPAINT_CN,
+  PROMPT_PATTERN_EXTRACT_CN,
+  ASPECT_OPTIONS,
   STORAGE_KEY_CONCURRENCY,
+  STORAGE_KEY_RESOLUTION_MODE,
+  STORAGE_KEY_START_NUMBER,
+  STORAGE_KEY_TARGET_ASPECT,
   STORAGE_KEY_VARIATION_SCENE,
   STORAGE_KEY_VARIATION_STRENGTH,
   SIZE_OPTIONS,
@@ -38,6 +47,8 @@ import {
   VARIATION_SCENES,
   VARIATION_STRENGTHS,
   buildVariationPrompt,
+  TASK_RETRY_DELAY_MS,
+  type ResolutionMode,
   type VariationScene,
   type VariationStrength,
 } from './lib/constants'
@@ -50,7 +61,7 @@ import {
   isImageFile,
 } from './lib/files'
 import { closestAspectLabel, is2kSizeLabel, sizeForAspect } from './lib/imageAspect'
-import { calculateExpandedSize, getImageDimensions, isValidSizeFormat } from './lib/imageSize'
+import { calculateExpandedSize, getImageDimensions, isValidSizeFormat, parseSize } from './lib/imageSize'
 import {
   clearResultImages,
   deleteResultImage,
@@ -61,7 +72,7 @@ import { ResultImage } from './components/ResultImage'
 import './App.css'
 
 type JobStatus = 'queued' | 'running' | 'done' | 'error'
-type JobType = 'outpaint' | 'variation' | 'text2img'
+type JobType = 'outpaint' | 'variation' | 'extract' | 'text2img'
 
 interface Job {
   id: string
@@ -152,6 +163,22 @@ function readInitialVariationStrength(): VariationStrength {
     : DEFAULT_VARIATION_STRENGTH
 }
 
+function readInitialResolutionMode(): ResolutionMode {
+  const saved = localStorage.getItem(STORAGE_KEY_RESOLUTION_MODE)
+  return RESOLUTION_MODES.some((option) => option.value === saved)
+    ? (saved as ResolutionMode)
+    : DEFAULT_RESOLUTION_MODE
+}
+
+function readInitialTargetAspect(): string {
+  const saved = localStorage.getItem(STORAGE_KEY_TARGET_ASPECT)
+  return ASPECT_OPTIONS.includes(saved as (typeof ASPECT_OPTIONS)[number]) ? saved ?? DEFAULT_TARGET_ASPECT : DEFAULT_TARGET_ASPECT
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 const DIRECTORY_INPUT_PROPS: InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string } = {
   webkitdirectory: '',
 }
@@ -175,6 +202,11 @@ export default function App() {
   const [customSize, setCustomSize] = useState(initialSizeState.customSize)
   const [useCustomSize, setUseCustomSize] = useState(initialSizeState.useCustomSize)
   const [prefix, setPrefix] = useState(() => localStorage.getItem(STORAGE_KEY_PREFIX) ?? 'A')
+  const [startNumberInput, setStartNumberInput] = useState(() => {
+    return String(normalizeStartNumber(localStorage.getItem(STORAGE_KEY_START_NUMBER) ?? String(DEFAULT_START_NUMBER)))
+  })
+  const [resolutionMode, setResolutionMode] = useState<ResolutionMode>(() => readInitialResolutionMode())
+  const [targetAspect, setTargetAspect] = useState(() => readInitialTargetAspect())
 
   // 功能设置
   const [expansionScale, setExpansionScale] = useState(
@@ -190,6 +222,7 @@ export default function App() {
   // 功能开关
   const [enableOutpaint, setEnableOutpaint] = useState(true)
   const [enableVariation, setEnableVariation] = useState(false)
+  const [enableExtract, setEnableExtract] = useState(false)
   const [enableText2Img, setEnableText2Img] = useState(false)
   const [isInputDragOver, setIsInputDragOver] = useState(false)
 
@@ -246,6 +279,12 @@ export default function App() {
     localStorage.setItem(STORAGE_KEY_PREFIX, prefix)
   }, [prefix])
   useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_RESOLUTION_MODE, resolutionMode)
+  }, [resolutionMode])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_TARGET_ASPECT, targetAspect)
+  }, [targetAspect])
+  useEffect(() => {
     localStorage.setItem(STORAGE_KEY_EXPANSION_SCALE, expansionScale)
   }, [expansionScale])
   useEffect(() => {
@@ -262,6 +301,12 @@ export default function App() {
     setVariationCount(normalized)
     setVariationCountInput(String(normalized))
   }, [variationCount, variationCountInput])
+  const commitStartNumberInput = useCallback(() => {
+    const normalized = normalizeStartNumber(startNumberInput)
+    const next = String(normalized)
+    setStartNumberInput(next)
+    localStorage.setItem(STORAGE_KEY_START_NUMBER, next)
+  }, [startNumberInput])
   const commitConcurrencyInput = useCallback(() => {
     const normalized = String(normalizeBatchConcurrency(concurrencyInput))
     setConcurrencyInput(normalized)
@@ -321,7 +366,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!enableOutpaint && !enableVariation) return
+    if (!enableOutpaint && !enableVariation && !enableExtract) return
     const onPaste = (e: ClipboardEvent) => {
       if (isRunning) return
       const dt = e.clipboardData
@@ -333,7 +378,7 @@ export default function App() {
     }
     window.addEventListener('paste', onPaste)
     return () => window.removeEventListener('paste', onPaste)
-  }, [isRunning, enableOutpaint, enableVariation, handleFilesSelected])
+  }, [isRunning, enableOutpaint, enableVariation, enableExtract, handleFilesSelected])
 
   // 移除输入文件
   const removeInputFile = useCallback((index: number) => {
@@ -447,7 +492,7 @@ export default function App() {
     })
   }, [])
 
-  // 运行批处理 - 分批处理版本（每批最多 10 张，单批最长 3 分钟）
+  // 运行批处理 - 分批处理版本（每批最多 10 个任务）
   const runBatch = useCallback(async () => {
     if (runInProgressRef.current) return
 
@@ -470,12 +515,16 @@ export default function App() {
     setVariationCount(normalizedVariationCount)
     setVariationCountInput(String(normalizedVariationCount))
 
+    const normalizedStartNumber = normalizeStartNumber(startNumberInput)
+    setStartNumberInput(String(normalizedStartNumber))
+    localStorage.setItem(STORAGE_KEY_START_NUMBER, String(normalizedStartNumber))
+
     // 快照当前输入，避免运行中 state 变化导致重复或遗漏
     const filesSnapshot = inputFiles
     const promptsSnapshot = excelPrompts
     const baseSize = useCustomSize ? customSize.trim() : size
     if (!isValidSizeFormat(baseSize)) {
-      alert('输出尺寸格式无效，请使用「宽x高」格式，例如 1024x1024。')
+      alert('分辨率格式无效，请使用「宽x高」格式，例如 1024x1024。')
       return
     }
     const use2kOutput = is2kSizeLabel(baseSize)
@@ -492,7 +541,7 @@ export default function App() {
     }
 
     const taskQueue: TaskItem[] = []
-    let outputSeq = 1
+    let outputSeq = normalizedStartNumber
 
     if (enableOutpaint && filesSnapshot.length > 0) {
       filesSnapshot.forEach((file, index) => {
@@ -519,6 +568,17 @@ export default function App() {
       })
     }
 
+    if (enableExtract && filesSnapshot.length > 0) {
+      filesSnapshot.forEach((file, index) => {
+        taskQueue.push({
+          file,
+          fileIndex: index,
+          jobType: 'extract',
+          outputName: generateOutputName(prefix, outputSeq++),
+        })
+      })
+    }
+
     if (enableText2Img && promptsSnapshot.length > 0) {
       promptsSnapshot.forEach((p, index) => {
         taskQueue.push({
@@ -540,6 +600,8 @@ export default function App() {
       return
     }
 
+    const nextStartNumberAfterRun = outputSeq
+
     const totalTasks = taskQueue.length
     setTotalTaskCount(totalTasks)
     setProcessedTaskCount(0)
@@ -550,31 +612,49 @@ export default function App() {
 
     const resolveEditParams = async (
       file: File,
-      jobType: 'outpaint' | 'variation',
+      jobType: 'outpaint' | 'variation' | 'extract',
     ): Promise<{ prompt: string; size: string; aspect_ratio: string }> => {
       const { width, height } = await getImageDimensions(file)
-      if (jobType === 'outpaint') {
+      let aspect: string
+      let sizeForRequest: string
+
+      if (resolutionMode === 'custom') {
+        const custom = parseSize(baseSize)
+        aspect = closestAspectLabel(custom.width, custom.height)
+        sizeForRequest = baseSize
+      } else if (resolutionMode === 'aspect') {
+        aspect = targetAspect
+        sizeForRequest = sizeForAspect(aspect, baseSize, use2kOutput)
+      } else {
         const expanded = calculateExpandedSize(width, height, parseFloat(expansionScale))
-        const aspect = closestAspectLabel(expanded.width, expanded.height)
-        return {
-          prompt: PROMPT_OUTPAINT_CN,
-          size: sizeForAspect(aspect, baseSize, use2kOutput),
-          aspect_ratio: aspect,
-        }
+        aspect = closestAspectLabel(expanded.width, expanded.height)
+        sizeForRequest = sizeForAspect(aspect, baseSize, use2kOutput)
       }
-      const aspect = closestAspectLabel(width, height)
+
       return {
-        prompt: buildVariationPrompt(variationScene, variationStrength),
-        size: sizeForAspect(aspect, baseSize, use2kOutput),
+        prompt:
+          jobType === 'outpaint'
+            ? PROMPT_OUTPAINT_CN
+            : jobType === 'extract'
+              ? PROMPT_PATTERN_EXTRACT_CN
+              : buildVariationPrompt(variationScene, variationStrength),
+        size: sizeForRequest,
         aspect_ratio: aspect,
       }
     }
 
+    const resolveTextToImageSize = (): string => {
+      if (resolutionMode === 'aspect') {
+        return sizeForAspect(targetAspect, baseSize, use2kOutput)
+      }
+      return baseSize
+    }
+
     const runOneTask = async (
       task: TaskItem,
-      batchCtx: { timedOut: { current: boolean }; activeControllers: Set<AbortController> },
+      batchCtx: { activeControllers: Set<AbortController> },
     ): Promise<{ imageDataUrl: string } | null> => {
-      if (cancelRef.current || batchCtx.timedOut.current) return null
+      if (cancelRef.current) return null
 
       const ac = new AbortController()
       batchCtx.activeControllers.add(ac)
@@ -590,7 +670,7 @@ export default function App() {
             {
               model: model.trim() || DEFAULT_MODEL,
               prompt: task.prompt ?? '',
-              size: baseSize,
+              size: resolveTextToImageSize(),
             },
             ac.signal,
           )
@@ -615,11 +695,11 @@ export default function App() {
           imageDataUrl = result.imageDataUrl
         }
 
-        if (batchCtx.timedOut.current) return null
+        if (cancelRef.current) return null
 
         return { imageDataUrl }
       } catch (e) {
-        if (cancelRef.current || batchCtx.timedOut.current || (e instanceof DOMException && e.name === 'AbortError')) {
+        if (cancelRef.current || (e instanceof DOMException && e.name === 'AbortError')) {
           return null
         }
         throw e
@@ -627,6 +707,32 @@ export default function App() {
         batchCtx.activeControllers.delete(ac)
         activeAbortControllersRef.current.delete(ac)
       }
+    }
+
+    const runOneTaskWithRetry = async (
+      task: TaskItem,
+      batchCtx: { activeControllers: Set<AbortController> },
+      jobId: string,
+    ): Promise<{ imageDataUrl: string } | null> => {
+      let lastError: unknown
+      for (let attempt = 0; attempt <= DEFAULT_TASK_RETRY_COUNT; attempt++) {
+        if (cancelRef.current) return null
+        try {
+          return await runOneTask(task, batchCtx)
+        } catch (e) {
+          lastError = e
+          if (cancelRef.current || (e instanceof DOMException && e.name === 'AbortError')) {
+            return null
+          }
+          if (attempt < DEFAULT_TASK_RETRY_COUNT) {
+            updateJob(jobId, {
+              error: `第 ${attempt + 1} 次失败，正在重试...`,
+            })
+            await delay(TASK_RETRY_DELAY_MS * (attempt + 1))
+          }
+        }
+      }
+      throw lastError
     }
 
     let taskCursor = 0
@@ -660,7 +766,6 @@ export default function App() {
         const concurrency = Math.min(normalizeBatchConcurrency(normalizedConcurrency), currentBatchSize)
         let taskIdxInBatch = 0
         const batchCtx = {
-          timedOut: { current: false },
           activeControllers: new Set<AbortController>(),
         }
         const jobSettled = new Set<string>()
@@ -674,7 +779,7 @@ export default function App() {
         }
 
         const worker = async () => {
-          while (!cancelRef.current && !batchCtx.timedOut.current) {
+          while (!cancelRef.current) {
             const myTask = taskIdxInBatch++
             if (myTask >= batchTasks.length) return
 
@@ -684,13 +789,10 @@ export default function App() {
             updateJob(jobId, { status: 'running' })
 
             try {
-              const result = await runOneTask(task, batchCtx)
+              const result = await runOneTaskWithRetry(task, batchCtx, jobId)
               if (result) {
-                if (batchCtx.timedOut.current || cancelRef.current) {
-                  markJobFinished(jobId, {
-                    status: 'error',
-                    error: batchCtx.timedOut.current ? BATCH_TIMEOUT_MESSAGE : CANCEL_MESSAGE,
-                  })
+                if (cancelRef.current) {
+                  markJobFinished(jobId, { status: 'error', error: CANCEL_MESSAGE })
                   continue
                 }
                 try {
@@ -715,8 +817,6 @@ export default function App() {
                 if (saveError) {
                   updateJob(jobId, { saveError })
                 }
-              } else if (batchCtx.timedOut.current) {
-                markJobFinished(jobId, { status: 'error', error: BATCH_TIMEOUT_MESSAGE })
               } else if (cancelRef.current) {
                 markJobFinished(jobId, { status: 'error', error: CANCEL_MESSAGE })
               } else {
@@ -729,25 +829,7 @@ export default function App() {
           }
         }
 
-        const workersPromise = Promise.all(Array.from({ length: concurrency }, () => worker()))
-
-        const batchTimer = setTimeout(() => {
-          batchCtx.timedOut.current = true
-          for (const ac of batchCtx.activeControllers) {
-            ac.abort()
-          }
-        }, BATCH_TIMEOUT_MS)
-
-        await workersPromise
-        clearTimeout(batchTimer)
-
-        if (batchCtx.timedOut.current) {
-          for (const job of batchJobs) {
-            if (!jobSettled.has(job.id)) {
-              markJobFinished(job.id, { status: 'error', error: BATCH_TIMEOUT_MESSAGE })
-            }
-          }
-        }
+        await Promise.all(Array.from({ length: concurrency }, () => worker()))
 
         taskCursor = batchEnd
 
@@ -759,12 +841,18 @@ export default function App() {
       activeAbortControllersRef.current.clear()
       runInProgressRef.current = false
       setIsRunning(false)
+      if (!cancelRef.current) {
+        const next = String(nextStartNumberAfterRun)
+        setStartNumberInput(next)
+        localStorage.setItem(STORAGE_KEY_START_NUMBER, next)
+      }
     }
   }, [
     apiBase,
     apiToken,
     enableOutpaint,
     enableVariation,
+    enableExtract,
     enableText2Img,
     inputFiles,
     excelPrompts,
@@ -779,6 +867,9 @@ export default function App() {
     prefix,
     concurrencyInput,
     variationCountInput,
+    startNumberInput,
+    resolutionMode,
+    targetAspect,
     updateJob,
     generateOutputName,
     saveJobToFolder,
@@ -903,13 +994,14 @@ export default function App() {
 
   const canStart = Boolean(
     apiToken.trim() &&
-      (((enableOutpaint || enableVariation) && inputFiles.length > 0) ||
+      (((enableOutpaint || enableVariation || enableExtract) && inputFiles.length > 0) ||
         (enableText2Img && excelPrompts.length > 0)),
   )
 
   const enabledFeatureCount =
     Number(enableOutpaint && inputFiles.length > 0) +
     Number(enableVariation && inputFiles.length > 0) +
+    Number(enableExtract && inputFiles.length > 0) +
     Number(enableText2Img && excelPrompts.length > 0)
 
   const totalBatchCount = totalTaskCount > 0 ? Math.ceil(totalTaskCount / BATCH_WINDOW_SIZE) : 0
@@ -918,7 +1010,7 @@ export default function App() {
     <div className="app">
       <header className="app-header">
         <h1>图片批量处理工具</h1>
-        <p className="app-tagline">图片扩充 · 图片裂变 · Excel 文生图</p>
+        <p className="app-tagline">图片扩充 · 图片裂变 · 图案提取 · Excel 文生图</p>
       </header>
 
       {/* 主布局：左右两列 */}
@@ -1008,6 +1100,14 @@ export default function App() {
               <label className="feature-toggle">
                 <input
                   type="checkbox"
+                  checked={enableExtract}
+                  onChange={(e) => setEnableExtract(e.target.checked)}
+                />
+                <span>图案提取/清晰化</span>
+              </label>
+              <label className="feature-toggle">
+                <input
+                  type="checkbox"
                   checked={enableText2Img}
                   onChange={(e) => setEnableText2Img(e.target.checked)}
                 />
@@ -1020,7 +1120,7 @@ export default function App() {
           <div className="sidebar-card">
             <h3>输出设置</h3>
             <div className="field">
-              <label htmlFor="size">输出尺寸</label>
+              <label htmlFor="size">分辨率</label>
               <select
                 id="size"
                 value={useCustomSize ? 'custom' : size}
@@ -1052,6 +1152,48 @@ export default function App() {
               )}
             </div>
             <div className="field">
+              <label htmlFor="resolution-mode">分辨率模式</label>
+              <select
+                id="resolution-mode"
+                value={resolutionMode}
+                disabled={isRunning}
+                onChange={(e) => {
+                  const next = e.target.value as ResolutionMode
+                  setResolutionMode(next)
+                  if (next === 'custom') {
+                    setUseCustomSize(true)
+                    setCustomSize((prev) => prev || size)
+                  }
+                }}
+              >
+                {RESOLUTION_MODES.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <span className="field-hint">
+                裂变和扩图会按此模式决定输出画幅；文生图使用比例或自定义分辨率。
+              </span>
+            </div>
+            {resolutionMode === 'aspect' && (
+              <div className="field">
+                <label htmlFor="target-aspect">画幅比例</label>
+                <select
+                  id="target-aspect"
+                  value={targetAspect}
+                  disabled={isRunning}
+                  onChange={(e) => setTargetAspect(e.target.value)}
+                >
+                  {ASPECT_OPTIONS.map((aspect) => (
+                    <option key={aspect} value={aspect}>
+                      {aspect}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div className="field">
               <label htmlFor="prefix">图片名前缀</label>
               <input
                 id="prefix"
@@ -1062,16 +1204,36 @@ export default function App() {
               />
               <span className="field-hint">示例：A1, A2, A3...</span>
             </div>
+            <div className="field">
+              <label htmlFor="start-number">起始编号</label>
+              <input
+                id="start-number"
+                type="text"
+                inputMode="numeric"
+                autoComplete="off"
+                disabled={isRunning}
+                value={startNumberInput}
+                onChange={(e) => {
+                  const v = e.target.value
+                  if (v === '' || /^\d{1,6}$/.test(v)) {
+                    setStartNumberInput(v)
+                  }
+                }}
+                onBlur={commitStartNumberInput}
+                placeholder={String(DEFAULT_START_NUMBER)}
+              />
+              <span className="field-hint">例如前缀 CS-、起始编号 31，会从 CS-31 开始。</span>
+            </div>
           </div>
 
           {/* 功能特定设置 */}
-          {(enableOutpaint || enableVariation) && (
+          {(enableOutpaint || enableVariation || enableExtract) && (
             <div className="sidebar-card">
               <h3>功能参数</h3>
               <div className="feature-settings">
-                {enableOutpaint && (
+                {(enableOutpaint || enableExtract || resolutionMode === 'scale') && (
                   <div className="setting-row">
-                    <label>扩充比例</label>
+                    <label>原图倍数</label>
                     <select
                       value={expansionScale}
                       onChange={(e) => setExpansionScale(e.target.value)}
@@ -1144,7 +1306,7 @@ export default function App() {
         {/* 右侧主内容区 */}
         <main className="app-main">
           {/* 功能一&二：图片输入 */}
-          {(enableOutpaint || enableVariation) && (
+          {(enableOutpaint || enableVariation || enableExtract) && (
             <div className="settings-card">
               <div className="settings-card-head">
                 <h2>📁 输入图片</h2>
@@ -1358,11 +1520,11 @@ export default function App() {
             <h3>🚀 开始处理</h3>
 
             <p className="batch-hint">
-              每批最多 {BATCH_WINDOW_SIZE} 张，单批最长 3 分钟；超时未完成的会自动跳过并进入下一批。
+              每批最多 {BATCH_WINDOW_SIZE} 个任务；失败任务会自动重试 {DEFAULT_TASK_RETRY_COUNT} 次。
             </p>
             {enabledFeatureCount > 1 ? (
               <p className="task-order-hint">
-                多任务同时开启时按顺序执行：扩充 → 裂变 → Excel 文生图。
+                多任务同时开启时按顺序执行：扩充 → 裂变 → 图案提取 → Excel 文生图。
               </p>
             ) : null}
 
@@ -1516,7 +1678,13 @@ export default function App() {
                     </div>
                     <div className="job-meta">
                       <span className="job-type">
-                        {job.jobType === 'outpaint' ? '🖼️ 扩充' : job.jobType === 'variation' ? '✨ 裂变' : '📝 文生图'}
+                        {job.jobType === 'outpaint'
+                          ? '🖼️ 扩充'
+                          : job.jobType === 'variation'
+                            ? '✨ 裂变'
+                            : job.jobType === 'extract'
+                              ? '🎯 提取'
+                              : '📝 文生图'}
                       </span>
                       {job.outputName && <span className="job-output">{job.outputName}</span>}
                     </div>
