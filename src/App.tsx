@@ -85,6 +85,9 @@ interface Job {
   addedSeq: number
   completedAt?: number
   jobType: JobType
+  fileIndex?: number
+  promptIndex?: number
+  variationIndex?: number
   prompt?: string
   targetSize?: string
   outputName?: string
@@ -752,6 +755,9 @@ export default function App() {
           previewObjectUrl: task.file ? URL.createObjectURL(task.file) : undefined,
           status: 'queued' as JobStatus,
           jobType: task.jobType,
+          fileIndex: task.fileIndex,
+          promptIndex: task.promptIndex,
+          variationIndex: task.variationIndex,
           prompt: task.prompt,
           outputName: task.outputName,
           addedSeq: addedSeqRef.current++,
@@ -982,14 +988,24 @@ export default function App() {
   }, [jobs])
 
   const displayJobs = useMemo(() => {
-    const rank = (s: JobStatus) => (s === 'done' ? 0 : s === 'running' ? 1 : s === 'queued' ? 2 : 3)
+    const jobTypeRank: Record<JobType, number> = {
+      outpaint: 0,
+      variation: 1,
+      extract: 2,
+      text2img: 3,
+    }
+    const sourceRank = (job: Job) => {
+      if (job.fileIndex != null) return job.fileIndex
+      if (job.promptIndex != null) return 100_000 + job.promptIndex
+      return 200_000 + job.addedSeq
+    }
     return [...jobs].sort((a, b) => {
-      const ra = rank(a.status)
-      const rb = rank(b.status)
-      if (ra !== rb) return ra - rb
-      if (a.status === 'done' && b.status === 'done') {
-        return (a.completedAt ?? 0) - (b.completedAt ?? 0)
-      }
+      const sourceDiff = sourceRank(a) - sourceRank(b)
+      if (sourceDiff !== 0) return sourceDiff
+      const typeDiff = jobTypeRank[a.jobType] - jobTypeRank[b.jobType]
+      if (typeDiff !== 0) return typeDiff
+      const variationDiff = (a.variationIndex ?? 0) - (b.variationIndex ?? 0)
+      if (variationDiff !== 0) return variationDiff
       return a.addedSeq - b.addedSeq
     })
   }, [jobs])
