@@ -30,11 +30,11 @@
 /* 主布局 - 左右两列 */
 .app-layout {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 340px minmax(0, 1fr);
   gap: 1rem;
   flex: 1;
   padding: 1rem;
-  max-width: 1800px;
+  max-width: 1900px;
   margin: 0 auto;
   width: 100%;
   box-sizing: border-box;
@@ -58,6 +58,51 @@
   margin: 0 0 0.6rem;
   font-size: 0.9rem;
   font-weight: 600;
+}
+
+.sidebar-card-collapsible {
+  padding: 0;
+  overflow: hidden;
+}
+
+.sidebar-card-toggle {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 0.875rem;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-card-toggle:hover {
+  background: var(--input-bg);
+}
+
+.sidebar-card-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.sidebar-card-caret {
+  color: var(--accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.sidebar-card-body {
+  padding: 0 0.875rem 0.875rem;
 }
 
 /* 右侧主内容区 */
@@ -119,9 +164,9 @@
 
 /* 功能开关 */
 .feature-toggles {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
 }
 
 .feature-toggle {
@@ -131,10 +176,18 @@
   font-size: 0.85rem;
   cursor: pointer;
   user-select: none;
-  padding: 0.4rem 0.6rem;
+  min-height: 2.2rem;
+  padding: 0.35rem 0.55rem;
   border-radius: 6px;
   background: var(--input-bg);
   transition: background 0.15s;
+}
+
+.feature-toggle span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .feature-toggle:hover {
@@ -443,7 +496,8 @@ label.btn,
 }
 
 .setting-row select,
-.setting-row input[type='number'] {
+.setting-row input[type='number'],
+.setting-row input[type='text'] {
   padding: 0.35rem 0.5rem;
   font-size: 0.8rem;
   border: 1px solid var(--border);
@@ -705,12 +759,16 @@ label.btn,
   border-radius: 10px;
   padding: 0.75rem;
   background: var(--input-bg);
-  transition: border-color 0.15s, background 0.15s;
+  outline: none;
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s;
 }
 
-.input-dropzone.is-dragover {
+.input-dropzone.is-dragover,
+.input-dropzone:focus,
+.input-dropzone:focus-within {
   border-color: var(--accent);
   background: var(--accent-soft);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 /* 结果区域 */
@@ -857,6 +915,15 @@ label.btn,
   align-items: center;
   justify-content: center;
   overflow: hidden;
+}
+
+.job-result-thumb {
+  cursor: pointer;
+}
+
+.job-result-thumb:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .job-images img {

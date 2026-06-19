@@ -24,13 +24,18 @@ export function parseSize(sizeStr: string): { width: number; height: number } {
   return { width: w, height: h }
 }
 
-/** 校验 API 尺寸字符串，格式为 宽x高 */
+/** 校验 gpt-image-2 API 尺寸字符串，格式为 宽x高 */
 export function isValidSizeFormat(sizeStr: string): boolean {
   const m = /^(\d+)x(\d+)$/i.exec(sizeStr.trim())
   if (!m) return false
   const w = parseInt(m[1], 10)
   const h = parseInt(m[2], 10)
-  return Number.isFinite(w) && Number.isFinite(h) && w >= 64 && h <= 8192 && h >= 64 && w <= 8192
+  if (!Number.isFinite(w) || !Number.isFinite(h)) return false
+  if (w % 16 !== 0 || h % 16 !== 0) return false
+  if (Math.max(w, h) > 3840) return false
+  if (Math.max(w, h) / Math.min(w, h) > 3) return false
+  const pixels = w * h
+  return pixels >= 655_360 && pixels <= 8_294_400
 }
 
 /**
@@ -52,4 +57,3 @@ export function calculateExpandedSize(
     height: Math.floor(targetHeight / 16) * 16,
   }
 }
-

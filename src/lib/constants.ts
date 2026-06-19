@@ -78,13 +78,15 @@ export const DEFAULT_VARIATION_STRENGTH: VariationStrength = 'balanced'
 /** 图片裂变提示词 */
 export const PROMPT_VARIATION = `MERCHANDISE PRINT VARIATION:
 Use the input image as visual inspiration, not as a layout to copy.
-Create a new commercial print design with a clearly different composition.
-Preserve the recognizable subject, style direction, color mood, and theme, but redesign the artwork with fresh details.
-Avoid simple redraws, near-duplicates, watermarks, mockup frames, and product photos unless explicitly requested.`
+Analyze the input image's theme, subject matter, visual medium, art style, color palette, texture, lighting, and motif language.
+Create a new artwork with the same theme family and the same visual medium/style, but redesign the composition and element arrangement.
+Keep the result suitable as a standalone commercial print pattern.
+Do not copy the original layout, crop, camera angle, or exact object positions.
+Avoid watermarks, mockup frames, product photos, before/after comparisons, and text labels.`
 
 const VARIATION_SCENE_PROMPTS: Record<VariationScene, string> = {
-  default: `通用印花图案：适合用于多种 POD 商品的商业插画或图案设计。主体明确，构图完整，画面比原图有明显变化，背景干净但不空洞，适合直接印刷。`,
-  apparel: `服装/家纺印花：适合 T 恤、卫衣、抱枕、毯子、布料印花。主体要醒目，装饰元素更丰富，边缘自然，适合织物印刷，避免复杂小字和过细线条。`,
+  default: `通用印花图案：适合用于多种 POD 商品。保持原图的艺术媒介和审美风格，例如油画继续油画、水彩继续水彩、摄影质感继续摄影质感、矢量扁平继续矢量扁平；不要自动改成插画风。`,
+  apparel: `服装/家纺印花：适合 T 恤、卫衣、抱枕、毯子、布料印花。主体要醒目，装饰元素更丰富，边缘自然，适合织物印刷，避免复杂小字和过细线条；同时保持原图艺术媒介。`,
   phone_case: `手机壳印花：竖版构图，主体居中或略偏上，保留安全边距，适合窄长手机壳画幅。画面要有装饰性背景，避免主体贴边或被裁切。`,
   line_art: `铁艺图形：转化为适合金属切割、线稿、雕刻或镂空工艺的图形。使用清晰轮廓、较少颜色、强对比、连贯线条，避免照片质感和复杂渐变。`,
   clock: `挂钟印花：适合圆形钟面。围绕圆形构图，主体和装饰元素平衡分布，可包含装饰边框、刻度感或数字区域，但不要让元素遮挡钟面可读性。`,
@@ -93,24 +95,61 @@ const VARIATION_SCENE_PROMPTS: Record<VariationScene, string> = {
 }
 
 const VARIATION_STRENGTH_PROMPTS: Record<VariationStrength, string> = {
-  subtle: `变化强度：轻微。保留原图主体和大致风格，但改变装饰细节、背景、姿态或局部元素，不能输出与原图几乎一致的结果。`,
-  balanced: `变化强度：中等。保留原图的主题灵感和视觉风格，但重新设计构图、背景、装饰元素和细节，结果应明显不同于原图。`,
-  bold: `变化强度：大胆。只保留原图的核心主体或风格灵感，进行全新商业图案创作，构图和细节要大幅变化。`,
+  subtle: `变化强度：轻微。保持原图的主题、媒介风格、色彩气质和大体布局，只替换或增减局部元素、纹理细节、装饰小物和局部背景，适合做同款轻微变体。`,
+  balanced: `变化强度：中等。保持同一主题和同一艺术媒介，但重新安排主体、背景、元素密度、留白和装饰节奏；画面应明显不同，不能只是重绘原图。`,
+  bold: `变化强度：大胆。必须保持主题相似和风格相似，但构图要大胆重构：改变视角或图案排布，替换部分元素组合，调整元素大小层级、密度、背景节奏和视觉焦点。结果应像同一系列的新设计，而不是原图的临摹、裁切、扩写或轻微改色。`,
+}
+
+const VARIATION_DIRECTION_PROMPTS: Record<VariationStrength, string[]> = {
+  subtle: [
+    `本张变化方向：保留原图主体布局，只替换少量局部元素和纹理细节，整体仍像同款轻微变体。`,
+    `本张变化方向：保留原图视角和空间结构，调整局部装饰物、颜色细节和背景小元素。`,
+    `本张变化方向：保持主体位置接近原图，但改变局部元素大小、疏密和边缘装饰。`,
+    `本张变化方向：保持原图节奏，只做细节丰富度、材质纹理和小元素组合的变化。`,
+  ],
+  balanced: [
+    `本张变化方向：重新安排主体和背景的位置关系，让视觉焦点明显不同，但保持同一主题和同一风格媒介。`,
+    `本张变化方向：改变元素密度和留白比例，使用新的图案节奏，不沿用原图主要构图。`,
+    `本张变化方向：改变视角或取景范围，重新组织关键元素的大小层级和前后关系。`,
+    `本张变化方向：保留主题元素类型，但替换部分元素组合，形成同系列的新图案。`,
+    `本张变化方向：让背景结构明显变化，例如从集中构图改为分散构图，或从分散构图改为中心构图。`,
+    `本张变化方向：改变画面的流动方向、边缘装饰和主体比例，避免与原图看起来像同一张图。`,
+  ],
+  bold: [
+    `本张大胆方向：使用全新的俯视/平铺式构图，关键元素重新分布成图案化画面；不要沿用原图的主体位置、裁切和视角。`,
+    `本张大胆方向：使用近景细节构图，放大局部材质、纹理和关键元素，背景节奏重新设计；仍保持原图真实/绘画媒介质感。`,
+    `本张大胆方向：做更密集的满版构图，增加同主题元素数量和大小层级变化，让画面像同系列新设计而非原图改色。`,
+    `本张大胆方向：做更清爽的留白构图，减少部分元素、拉开空间关系、改变视觉焦点；主题和风格不变。`,
+    `本张大胆方向：采用对角线、弧形或流动式构图，让画面运动方向完全不同，关键元素重新组合。`,
+    `本张大胆方向：替换约一半的次要元素为同主题家族的新元素，保留核心题材和媒介风格，但画面结构必须明显不同。`,
+    `本张大胆方向：改变主体尺度关系，把原来的大元素变小或把小元素变成视觉焦点，重建前景、中景、背景。`,
+    `本张大胆方向：改变取景距离和空间层次，加入新的同主题背景结构，避免复制原图的元素位置和整体轮廓。`,
+  ],
+}
+
+function buildVariationDirectionPrompt(strength: VariationStrength, variationIndex?: number): string {
+  if (variationIndex == null) return ''
+  const prompts = VARIATION_DIRECTION_PROMPTS[strength]
+  return prompts[variationIndex % prompts.length]
 }
 
 /** 图片裂变提示词（中文） */
-export function buildVariationPrompt(scene: VariationScene, strength: VariationStrength): string {
+export function buildVariationPrompt(scene: VariationScene, strength: VariationStrength, variationIndex?: number): string {
+  const directionPrompt = buildVariationDirectionPrompt(strength, variationIndex)
   return `【图片裂变 / 印花再设计】
-请把输入图片作为灵感参考，而不是复制对象。生成一张新的商业印花图案。
+请把输入图片作为主题和风格参考，而不是复制对象。生成一张新的商业印花图案。
 
 核心要求：
-1. 保留原图可识别的主体、主题气质、色彩情绪和大致风格方向。
-2. 必须重新设计构图、背景、装饰元素和画面细节，避免简单重绘、换色或输出近似原图。
-3. 输出应像一张可直接用于 POD 商品的高清图案，不要生成产品样机、边框截图、水印、文字说明或对比图。
-4. 画面主体清晰，商业感强，适合印刷，细节丰富但不要杂乱。
+1. 先识别原图的主题词、主要元素、艺术媒介、笔触/材质、色彩气质、光影和装饰语言。
+2. 必须保持原图的艺术媒介和风格质感：油画不能变插画，水彩不能变矢量，照片不能变卡通，手绘线稿不能变厚涂。
+3. 主题要相似：保留同一题材家族和关键元素类型，但不要复刻原图的构图、裁切、视角、元素位置或主体比例。
+4. 根据变化强度重新设计构图、背景、元素密度、装饰节奏和细节组合，让结果像同系列新图。
+5. 如果原图是真实摄影或真实质感场景，输出也必须是真实摄影/真实质感场景；变化只发生在构图、元素组合和取景方式上。
+6. 输出应像一张可直接用于 POD 商品的高清图案，不要生成产品样机、边框截图、水印、文字说明或对比图。
 
 ${VARIATION_SCENE_PROMPTS[scene]}
-${VARIATION_STRENGTH_PROMPTS[strength]}`
+${VARIATION_STRENGTH_PROMPTS[strength]}
+${directionPrompt}`
 }
 
 export const STORAGE_KEY_TOKEN = 'batch_image_api_token'
@@ -125,6 +164,7 @@ export const STORAGE_KEY_VARIATION_SCENE = 'batch_image_variation_scene'
 export const STORAGE_KEY_VARIATION_STRENGTH = 'batch_image_variation_strength'
 export const STORAGE_KEY_RESOLUTION_MODE = 'batch_image_resolution_mode'
 export const STORAGE_KEY_TARGET_ASPECT = 'batch_image_target_aspect'
+export const STORAGE_KEY_CUSTOM_TARGET_ASPECT = 'batch_image_custom_target_aspect'
 
 /** 默认尺寸 */
 export const DEFAULT_SIZE = '1024x1024'

@@ -33,6 +33,7 @@ import {
   STORAGE_KEY_CONCURRENCY,
   STORAGE_KEY_RESOLUTION_MODE,
   STORAGE_KEY_START_NUMBER,
+  STORAGE_KEY_CUSTOM_TARGET_ASPECT,
   STORAGE_KEY_TARGET_ASPECT,
   STORAGE_KEY_VARIATION_SCENE,
   STORAGE_KEY_VARIATION_STRENGTH,
@@ -60,8 +61,8 @@ import {
   getImageFilesFromDataTransfer,
   isImageFile,
 } from './lib/files'
-import { closestAspectLabel, is2kSizeLabel, sizeForAspect } from './lib/imageAspect'
-import { calculateExpandedSize, getImageDimensions, isValidSizeFormat, parseSize } from './lib/imageSize'
+import { closestAspectLabel, is2kSizeLabel, isValidAspectRatioLabel, sizeForAspect } from './lib/imageAspect'
+import { calculateExpandedSize, getImageDimensions, isValidSizeFormat } from './lib/imageSize'
 import {
   clearResultImages,
   deleteResultImage,
@@ -172,7 +173,13 @@ function readInitialResolutionMode(): ResolutionMode {
 
 function readInitialTargetAspect(): string {
   const saved = localStorage.getItem(STORAGE_KEY_TARGET_ASPECT)
-  return ASPECT_OPTIONS.includes(saved as (typeof ASPECT_OPTIONS)[number]) ? saved ?? DEFAULT_TARGET_ASPECT : DEFAULT_TARGET_ASPECT
+  return saved && isValidAspectRatioLabel(saved) ? saved : DEFAULT_TARGET_ASPECT
+}
+
+function readInitialCustomTargetAspect(targetAspect: string): string {
+  const saved = localStorage.getItem(STORAGE_KEY_CUSTOM_TARGET_ASPECT)
+  if (saved && isValidAspectRatioLabel(saved)) return saved
+  return ASPECT_OPTIONS.includes(targetAspect as (typeof ASPECT_OPTIONS)[number]) ? '9:18' : targetAspect
 }
 
 function delay(ms: number): Promise<void> {
@@ -196,7 +203,9 @@ export default function App() {
     return saved ?? DEFAULT_API_BASE
   })
   const [apiToken, setApiToken] = useState(() => localStorage.getItem(STORAGE_KEY_TOKEN) ?? '')
+  const [apiSettingsOpen, setApiSettingsOpen] = useState(() => !localStorage.getItem(STORAGE_KEY_TOKEN))
   const initialSizeState = useMemo(() => readInitialSizeState(), [])
+  const initialTargetAspect = useMemo(() => readInitialTargetAspect(), [])
   const [model, setModel] = useState(() => localStorage.getItem(STORAGE_KEY_MODEL) ?? DEFAULT_MODEL)
   const [size, setSize] = useState(initialSizeState.size)
   const [customSize, setCustomSize] = useState(initialSizeState.customSize)
@@ -206,7 +215,11 @@ export default function App() {
     return String(normalizeStartNumber(localStorage.getItem(STORAGE_KEY_START_NUMBER) ?? String(DEFAULT_START_NUMBER)))
   })
   const [resolutionMode, setResolutionMode] = useState<ResolutionMode>(() => readInitialResolutionMode())
-  const [targetAspect, setTargetAspect] = useState(() => readInitialTargetAspect())
+  const [targetAspect, setTargetAspect] = useState(initialTargetAspect)
+  const [customTargetAspect, setCustomTargetAspect] = useState(() => readInitialCustomTargetAspect(initialTargetAspect))
+  const [useCustomTargetAspect, setUseCustomTargetAspect] = useState(
+    () => !ASPECT_OPTIONS.includes(initialTargetAspect as (typeof ASPECT_OPTIONS)[number]),
+  )
 
   // 功能设置
   const [expansionScale, setExpansionScale] = useState(
@@ -284,6 +297,9 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_TARGET_ASPECT, targetAspect)
   }, [targetAspect])
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_CUSTOM_TARGET_ASPECT, customTargetAspect)
+  }, [customTargetAspect])
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY_EXPANSION_SCALE, expansionScale)
   }, [expansionScale])
@@ -364,21 +380,6 @@ export default function App() {
     if (arr.length === 0) return
     setInputFiles((prev) => [...prev, ...arr])
   }, [])
-
-  useEffect(() => {
-    if (!enableOutpaint && !enableVariation && !enableExtract) return
-    const onPaste = (e: ClipboardEvent) => {
-      if (isRunning) return
-      const dt = e.clipboardData
-      if (!dt) return
-      const files = getImageFilesFromDataTransfer(dt)
-      if (files.length === 0) return
-      e.preventDefault()
-      handleFilesSelected(files)
-    }
-    window.addEventListener('paste', onPaste)
-    return () => window.removeEventListener('paste', onPaste)
-  }, [isRunning, enableOutpaint, enableVariation, enableExtract, handleFilesSelected])
 
   // 移除输入文件
   const removeInputFile = useCallback((index: number) => {
@@ -524,7 +525,11 @@ export default function App() {
     const promptsSnapshot = excelPrompts
     const baseSize = useCustomSize ? customSize.trim() : size
     if (!isValidSizeFormat(baseSize)) {
-      alert('分辨率格式无效，请使用「宽x高」格式，例如 1024x1024。')
+      alert('分辨率无效：请使用「宽x高」，两边为 16 的倍数，最长边不超过 3840，长短边不超过 3:1，像素数在 655360 到 8294400 之间。')
+      return
+    }
+    if (resolutionMode === 'aspect' && !isValidAspectRatioLabel(targetAspect)) {
+      alert('画幅比例无效：请使用「宽:高」格式，例如 9:16、1:2、1:2.2；长短边比例不能超过 3:1。')
       return
     }
     const use2kOutput = is2kSizeLabel(baseSize)
@@ -613,14 +618,13 @@ export default function App() {
     const resolveEditParams = async (
       file: File,
       jobType: 'outpaint' | 'variation' | 'extract',
-    ): Promise<{ prompt: string; size: string; aspect_ratio: string }> => {
+      variationIndex?: number,
+    ): Promise<{ prompt: string; size: string }> => {
       const { width, height } = await getImageDimensions(file)
       let aspect: string
       let sizeForRequest: string
 
       if (resolutionMode === 'custom') {
-        const custom = parseSize(baseSize)
-        aspect = closestAspectLabel(custom.width, custom.height)
         sizeForRequest = baseSize
       } else if (resolutionMode === 'aspect') {
         aspect = targetAspect
@@ -637,9 +641,8 @@ export default function App() {
             ? PROMPT_OUTPAINT_CN
             : jobType === 'extract'
               ? PROMPT_PATTERN_EXTRACT_CN
-              : buildVariationPrompt(variationScene, variationStrength),
+              : buildVariationPrompt(variationScene, variationStrength, variationIndex),
         size: sizeForRequest,
-        aspect_ratio: aspect,
       }
     }
 
@@ -679,7 +682,7 @@ export default function App() {
           if (!task.file) {
             throw new Error('缺少输入图片')
           }
-          const editParams = await resolveEditParams(task.file, task.jobType)
+          const editParams = await resolveEditParams(task.file, task.jobType, task.variationIndex)
           const result = await postImagesEdits(
             base,
             token,
@@ -687,7 +690,6 @@ export default function App() {
               model: model.trim() || DEFAULT_MODEL,
               prompt: editParams.prompt,
               size: editParams.size,
-              aspect_ratio: editParams.aspect_ratio,
               images: [task.file],
             },
             ac.signal,
@@ -1018,63 +1020,78 @@ export default function App() {
         {/* 左侧边栏 */}
         <aside className="app-sidebar">
           {/* API 设置 */}
-          <div className="sidebar-card">
-            <h3>API 设置</h3>
-            <div className="field">
-              <label htmlFor="token">API 密钥</label>
-              <input
-                id="token"
-                className="toolbar-input"
-                type="password"
-                value={apiToken}
-                onChange={(e) => setApiToken(e.target.value)}
-                placeholder="sk-..."
-                autoComplete="off"
-              />
-              <span className="token-privacy-hint">密钥仅保存在本机浏览器，请勿在公共电脑使用。</span>
-            </div>
-            <div className="field">
-              <label htmlFor="base">接口地址</label>
-              <input
-                id="base"
-                type="url"
-                value={apiBase}
-                onChange={(e) => setApiBase(e.target.value)}
-                placeholder="https://ai.t8star.org"
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="model">模型</label>
-              <input
-                id="model"
-                type="text"
-                value={model}
-                onChange={(e) => setModel(e.target.value)}
-                placeholder="gpt-image-2"
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="concurrency">并发数</label>
-              <input
-                id="concurrency"
-                type="text"
-                inputMode="numeric"
-                autoComplete="off"
-                value={concurrencyInput}
-                disabled={isRunning}
-                onChange={(e) => {
-                  const v = e.target.value
-                  if (v === '' || /^\d{1,2}$/.test(v)) {
-                    setConcurrencyInput(v)
-                  }
-                }}
-                onBlur={commitConcurrencyInput}
-                placeholder={String(DEFAULT_BATCH_CONCURRENCY)}
-              />
-              <span className="field-hint">
-                同时处理的请求数（{MIN_BATCH_CONCURRENCY}-{MAX_BATCH_CONCURRENCY}）
+          <div className="sidebar-card sidebar-card-collapsible">
+            <button
+              type="button"
+              className="sidebar-card-toggle"
+              aria-expanded={apiSettingsOpen}
+              onClick={() => setApiSettingsOpen((open) => !open)}
+            >
+              <span>API 设置</span>
+              <span className="sidebar-card-summary">
+                {apiToken.trim() ? '已配置' : '未配置'} · {model.trim() || DEFAULT_MODEL}
               </span>
-            </div>
+              <span className="sidebar-card-caret">{apiSettingsOpen ? '收起' : '展开'}</span>
+            </button>
+            {apiSettingsOpen ? (
+              <div className="sidebar-card-body">
+                <div className="field">
+                  <label htmlFor="token">API 密钥</label>
+                  <input
+                    id="token"
+                    className="toolbar-input"
+                    type="password"
+                    value={apiToken}
+                    onChange={(e) => setApiToken(e.target.value)}
+                    placeholder="sk-..."
+                    autoComplete="off"
+                  />
+                  <span className="token-privacy-hint">密钥仅保存在本机浏览器，请勿在公共电脑使用。</span>
+                </div>
+                <div className="field">
+                  <label htmlFor="base">接口地址</label>
+                  <input
+                    id="base"
+                    type="url"
+                    value={apiBase}
+                    onChange={(e) => setApiBase(e.target.value)}
+                    placeholder="https://ai.t8star.org"
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="model">模型</label>
+                  <input
+                    id="model"
+                    type="text"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    placeholder="gpt-image-2"
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="concurrency">并发数</label>
+                  <input
+                    id="concurrency"
+                    type="text"
+                    inputMode="numeric"
+                    autoComplete="off"
+                    value={concurrencyInput}
+                    disabled={isRunning}
+                    onChange={(e) => {
+                      const v = e.target.value
+                      if (v === '' || /^\d{1,2}$/.test(v)) {
+                        setConcurrencyInput(v)
+                      }
+                    }}
+                    onBlur={commitConcurrencyInput}
+                    placeholder={String(DEFAULT_BATCH_CONCURRENCY)}
+                  />
+                  <span className="field-hint">
+                    同时处理的请求数（{MIN_BATCH_CONCURRENCY}-{MAX_BATCH_CONCURRENCY}）
+                  </span>
+                </div>
+              </div>
+            ) : null}
           </div>
 
           {/* 功能开关 */}
@@ -1181,16 +1198,46 @@ export default function App() {
                 <label htmlFor="target-aspect">画幅比例</label>
                 <select
                   id="target-aspect"
-                  value={targetAspect}
+                  value={useCustomTargetAspect ? 'custom' : targetAspect}
                   disabled={isRunning}
-                  onChange={(e) => setTargetAspect(e.target.value)}
+                  onChange={(e) => {
+                    if (e.target.value === 'custom') {
+                      const next = customTargetAspect || '9:18'
+                      setUseCustomTargetAspect(true)
+                      setCustomTargetAspect(next)
+                      setTargetAspect(next)
+                    } else {
+                      setUseCustomTargetAspect(false)
+                      setTargetAspect(e.target.value)
+                    }
+                  }}
                 >
                   {ASPECT_OPTIONS.map((aspect) => (
                     <option key={aspect} value={aspect}>
                       {aspect}
                     </option>
                   ))}
+                  <option value="custom">自定义...</option>
                 </select>
+                {useCustomTargetAspect && (
+                  <>
+                    <input
+                      type="text"
+                      value={customTargetAspect}
+                      disabled={isRunning}
+                      onChange={(e) => {
+                        const next = e.target.value
+                        if (/^[\d:.xX\s]{0,16}$/.test(next)) {
+                          setCustomTargetAspect(next)
+                          setTargetAspect(next)
+                        }
+                      }}
+                      placeholder="宽:高，如 9:18 或 1:2.2"
+                      className="custom-size-input"
+                    />
+                    <span className="field-hint">自定义比例会自动换算为符合接口约束的分辨率。</span>
+                  </>
+                )}
               </div>
             )}
             <div className="field">
@@ -1314,6 +1361,20 @@ export default function App() {
               <div className="settings-card-body">
                 <div
                   className={`input-dropzone${isInputDragOver ? ' is-dragover' : ''}`}
+                  tabIndex={isRunning ? -1 : 0}
+                  onPaste={(e) => {
+                    if (isRunning) return
+                    const files = getImageFilesFromDataTransfer(e.clipboardData)
+                    if (files.length === 0) return
+                    e.preventDefault()
+                    handleFilesSelected(files)
+                  }}
+                  onMouseDown={(e) => {
+                    if (isRunning) return
+                    if (e.target === e.currentTarget || (e.target as HTMLElement).closest('.dropzone-sub')) {
+                      e.currentTarget.focus()
+                    }
+                  }}
                   onDragOver={(e) => {
                     e.preventDefault()
                     if (!isRunning) setIsInputDragOver(true)
@@ -1331,79 +1392,79 @@ export default function App() {
                     if (files.length) handleFilesSelected(files)
                   }}
                 >
-                <p className="dropzone-sub" style={{ margin: 0 }}>
-                  上传图片、拖拽到此处，或粘贴 (Ctrl/Cmd + V) · 支持多选
-                </p>
+                  <p className="dropzone-sub" style={{ margin: 0 }}>
+                    点击选中此区域后粘贴 (Ctrl/Cmd + V)，也可上传或拖拽图片 · 支持多选
+                  </p>
 
-                <div className="excel-upload-row">
-                  <label className="btn btn-secondary">
-                    选择图片
-                    <input
-                      type="file"
-                      accept="image/*"
-                      multiple
-                      disabled={isRunning}
-                      onChange={(e) => {
-                        if (e.target.files?.length) {
-                          handleFilesSelected(e.target.files)
-                        }
-                        e.target.value = ''
-                      }}
-                    />
-                  </label>
-                  <label className="btn btn-secondary">
-                    从文件夹导入
-                    <input
-                      type="file"
-                      {...DIRECTORY_INPUT_PROPS}
-                      disabled={isRunning}
-                      onChange={(e) => {
-                        if (e.target.files?.length) {
-                          handleFilesSelected(e.target.files)
-                        }
-                        e.target.value = ''
-                      }}
-                    />
-                  </label>
-                </div>
-
-                {inputFiles.length > 0 && (
-                  <div className="input-files-list">
-                    <div className="input-files-header">
-                      <span>
-                        已添加 {inputFiles.length} 张图片（预览前 20 张
-                        {inputFiles.length > 20 ? `，另有 ${inputFiles.length - 20} 张未展示` : ''}）
-                      </span>
-                      <button
-                        type="button"
-                        className="btn btn-ghost"
+                  <div className="excel-upload-row">
+                    <label className="btn btn-secondary">
+                      选择图片
+                      <input
+                        type="file"
+                        accept="image/*"
+                        multiple
                         disabled={isRunning}
-                        onClick={clearInputFiles}
-                      >
-                        清空
-                      </button>
-                    </div>
-                    <div className="input-files-grid">
-                      {inputFiles.slice(0, 20).map((file, index) => (
-                        <div key={`${file.name}-${file.size}-${file.lastModified}-${index}`} className="input-file-item">
-                          <img
-                            src={inputPreviewUrls[index]}
-                            alt={file.name}
-                            title={file.name}
-                          />
-                          <button
-                            type="button"
-                            className="remove-btn"
-                            disabled={isRunning}
-                            onClick={() => removeInputFile(index)}
-                          >
-                            ×
-                          </button>
-                        </div>
-                      ))}
-                    </div>
+                        onChange={(e) => {
+                          if (e.target.files?.length) {
+                            handleFilesSelected(e.target.files)
+                          }
+                          e.target.value = ''
+                        }}
+                      />
+                    </label>
+                    <label className="btn btn-secondary">
+                      从文件夹导入
+                      <input
+                        type="file"
+                        {...DIRECTORY_INPUT_PROPS}
+                        disabled={isRunning}
+                        onChange={(e) => {
+                          if (e.target.files?.length) {
+                            handleFilesSelected(e.target.files)
+                          }
+                          e.target.value = ''
+                        }}
+                      />
+                    </label>
                   </div>
-                )}
+
+                  {inputFiles.length > 0 && (
+                    <div className="input-files-list">
+                      <div className="input-files-header">
+                        <span>
+                          已添加 {inputFiles.length} 张图片（预览前 20 张
+                          {inputFiles.length > 20 ? `，另有 ${inputFiles.length - 20} 张未展示` : ''}）
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          disabled={isRunning}
+                          onClick={clearInputFiles}
+                        >
+                          清空
+                        </button>
+                      </div>
+                      <div className="input-files-grid">
+                        {inputFiles.slice(0, 20).map((file, index) => (
+                          <div key={`${file.name}-${file.size}-${file.lastModified}-${index}`} className="input-file-item">
+                            <img
+                              src={inputPreviewUrls[index]}
+                              alt={file.name}
+                              title={file.name}
+                            />
+                            <button
+                              type="button"
+                              className="remove-btn"
+                              disabled={isRunning}
+                              onClick={() => removeInputFile(index)}
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -1695,7 +1756,23 @@ export default function App() {
                           <figcaption>原图</figcaption>
                         </figure>
                       )}
-                      <figure>
+                      <figure
+                        className={job.hasResult ? 'job-result-thumb' : undefined}
+                        role={job.hasResult ? 'button' : undefined}
+                        tabIndex={job.hasResult ? 0 : undefined}
+                        onClick={job.hasResult ? () => void openResultPreview(job) : undefined}
+                        onKeyDown={
+                          job.hasResult
+                            ? (e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault()
+                                  void openResultPreview(job)
+                                }
+                              }
+                            : undefined
+                        }
+                        title={job.hasResult ? '点击查看生成图' : undefined}
+                      >
                         {job.hasResult ? (
                           <ResultImage
                             imageId={job.id}

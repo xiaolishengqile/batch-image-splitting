@@ -4,7 +4,6 @@ export interface EditsBody {
   model: string
   prompt: string
   size: string
-  aspect_ratio: string
   /** 待编辑的图片 */
   images: File[]
 }
@@ -35,9 +34,8 @@ export async function postImagesEdits(
   form.append('model', body.model)
   form.append('prompt', body.prompt)
   form.append('size', body.size)
-  form.append('aspect_ratio', body.aspect_ratio)
   for (const file of body.images) {
-    form.append('image[]', file, file.name)
+    form.append('image', file, file.name)
   }
 
   const res = await fetch(url, {
