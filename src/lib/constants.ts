@@ -150,10 +150,39 @@ const VARIATION_DIRECTION_PROMPTS: Record<VariationStrength, string[]> = {
   ],
 }
 
-function buildVariationDirectionPrompt(strength: VariationStrength, variationIndex?: number): string {
+/** 从 [0, poolSize) 中随机抽取 count 个不重复的下标 */
+export function pickRandomDirectionIndices(count: number, poolSize: number): number[] {
+  if (count <= 0 || poolSize <= 0) return []
+  const n = Math.min(count, poolSize)
+  const indices = Array.from({ length: poolSize }, (_, i) => i)
+  for (let i = 0; i < n; i++) {
+    const j = i + Math.floor(Math.random() * (poolSize - i))
+    ;[indices[i], indices[j]] = [indices[j], indices[i]]
+  }
+  return indices.slice(0, n)
+}
+
+/** 为一次裂变批次随机分配方向下标；大胆变化第 1 张固定为参考原图风格 */
+export function pickVariationDirectionIndices(strength: VariationStrength, count: number): number[] {
+  const poolSize = VARIATION_DIRECTION_PROMPTS[strength].length
+  if (count <= 0) return []
+  if (strength === 'bold') {
+    if (count === 1) return [0]
+    const rest = pickRandomDirectionIndices(count - 1, poolSize - 1)
+    return [0, ...rest.map((i) => i + 1)]
+  }
+  return pickRandomDirectionIndices(count, poolSize)
+}
+
+function buildVariationDirectionPrompt(
+  strength: VariationStrength,
+  variationIndex?: number,
+  directionIndex?: number,
+): string {
   if (variationIndex == null) return ''
   const prompts = VARIATION_DIRECTION_PROMPTS[strength]
-  const prompt = prompts[variationIndex % prompts.length]
+  const index = directionIndex ?? variationIndex % prompts.length
+  const prompt = prompts[index]
   if (strength === 'bold') {
     return `本张大胆变化是第 ${variationIndex + 1} 张裂变图，必须使用指定风格方向：${prompt}`
   }
@@ -161,8 +190,13 @@ function buildVariationDirectionPrompt(strength: VariationStrength, variationInd
 }
 
 /** 图片裂变提示词（中文） */
-export function buildVariationPrompt(scene: VariationScene, strength: VariationStrength, variationIndex?: number): string {
-  const directionPrompt = buildVariationDirectionPrompt(strength, variationIndex)
+export function buildVariationPrompt(
+  scene: VariationScene,
+  strength: VariationStrength,
+  variationIndex?: number,
+  directionIndex?: number,
+): string {
+  const directionPrompt = buildVariationDirectionPrompt(strength, variationIndex, directionIndex)
   const looseSubject = strength === 'balanced' || strength === 'bold'
   const isFirstBoldVariation = strength === 'bold' && variationIndex === 0
   const styleRule =

@@ -48,6 +48,7 @@ import {
   VARIATION_SCENES,
   VARIATION_STRENGTHS,
   buildVariationPrompt,
+  pickVariationDirectionIndices,
   TASK_RETRY_DELAY_MS,
   type ResolutionMode,
   type VariationScene,
@@ -545,6 +546,7 @@ export default function App() {
       promptIndex?: number
       jobType: JobType
       variationIndex?: number
+      directionIndex?: number
       outputName: string
     }
 
@@ -564,12 +566,14 @@ export default function App() {
 
     if (enableVariation && filesSnapshot.length > 0) {
       filesSnapshot.forEach((file, index) => {
+        const directionIndices = pickVariationDirectionIndices(variationStrength, normalizedVariationCount)
         for (let i = 0; i < normalizedVariationCount; i++) {
           taskQueue.push({
             file,
             fileIndex: index,
             jobType: 'variation',
             variationIndex: i,
+            directionIndex: directionIndices[i],
             outputName: generateOutputName(prefix, outputSeq++),
           })
         }
@@ -622,6 +626,7 @@ export default function App() {
       file: File,
       jobType: 'outpaint' | 'variation' | 'extract',
       variationIndex?: number,
+      directionIndex?: number,
     ): Promise<{ prompt: string; size: string }> => {
       const { width, height } = await getImageDimensions(file)
       let aspect: string
@@ -644,7 +649,7 @@ export default function App() {
             ? PROMPT_OUTPAINT_CN
             : jobType === 'extract'
               ? PROMPT_PATTERN_EXTRACT_CN
-              : buildVariationPrompt(variationScene, variationStrength, variationIndex),
+              : buildVariationPrompt(variationScene, variationStrength, variationIndex, directionIndex),
         size: sizeForRequest,
       }
     }
@@ -685,7 +690,12 @@ export default function App() {
           if (!task.file) {
             throw new Error('缺少输入图片')
           }
-          const editParams = await resolveEditParams(task.file, task.jobType, task.variationIndex)
+          const editParams = await resolveEditParams(
+            task.file,
+            task.jobType,
+            task.variationIndex,
+            task.directionIndex,
+          )
           const result = await postImagesEdits(
             base,
             token,
