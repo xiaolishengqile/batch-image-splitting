@@ -47,6 +47,7 @@ import {
   STORAGE_KEY_VARIATION_COUNT,
   VARIATION_SCENES,
   VARIATION_STRENGTHS,
+  appendTargetAspectPrompt,
   buildVariationPrompt,
   pickVariationDirectionIndices,
   TASK_RETRY_DELAY_MS,
@@ -63,7 +64,7 @@ import {
   isImageFile,
 } from './lib/files'
 import { closestAspectLabel, is2kSizeLabel, isValidAspectRatioLabel, sizeForAspect } from './lib/imageAspect'
-import { calculateExpandedSize, getImageDimensions, isValidSizeFormat } from './lib/imageSize'
+import { calculateExpandedSize, getImageDimensions, isValidSizeFormat, parseSize } from './lib/imageSize'
 import {
   clearResultImages,
   deleteResultImage,
@@ -629,33 +630,31 @@ export default function App() {
       directionIndex?: number,
     ): Promise<{ prompt: string; size: string }> => {
       const { width, height } = await getImageDimensions(file)
-      let aspect: string
+      let aspectForPrompt: string
       let sizeForRequest: string
 
       if (resolutionMode === 'custom') {
         sizeForRequest = baseSize
+        const customSize = parseSize(baseSize)
+        aspectForPrompt = closestAspectLabel(customSize.width, customSize.height)
       } else if (resolutionMode === 'aspect') {
-        aspect = targetAspect
-        sizeForRequest = sizeForAspect(aspect, baseSize, use2kOutput)
+        aspectForPrompt = targetAspect
+        sizeForRequest = sizeForAspect(targetAspect, baseSize, use2kOutput)
       } else {
         const expanded = calculateExpandedSize(width, height, parseFloat(expansionScale))
-        aspect = closestAspectLabel(expanded.width, expanded.height)
-        sizeForRequest = sizeForAspect(aspect, baseSize, use2kOutput)
+        aspectForPrompt = closestAspectLabel(expanded.width, expanded.height)
+        sizeForRequest = sizeForAspect(aspectForPrompt, baseSize, use2kOutput)
       }
 
+      const basePrompt =
+        jobType === 'outpaint'
+          ? PROMPT_OUTPAINT_CN
+          : jobType === 'extract'
+            ? PROMPT_PATTERN_EXTRACT_CN
+            : buildVariationPrompt(variationScene, variationStrength, variationIndex, directionIndex)
+
       return {
-        prompt:
-          jobType === 'outpaint'
-            ? PROMPT_OUTPAINT_CN
-            : jobType === 'extract'
-              ? PROMPT_PATTERN_EXTRACT_CN
-              : buildVariationPrompt(
-                  variationScene,
-                  variationStrength,
-                  variationIndex,
-                  directionIndex,
-                  resolutionMode === 'aspect' ? targetAspect : undefined,
-                ),
+        prompt: appendTargetAspectPrompt(basePrompt, aspectForPrompt),
         size: sizeForRequest,
       }
     }

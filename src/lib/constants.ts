@@ -189,13 +189,22 @@ function buildVariationDirectionPrompt(
   return prompt
 }
 
+/** 在 prompt 中指定目标画幅比例（用于 edits API 不响应 size 参数时） */
+export function buildTargetAspectPrompt(targetAspect: string): string {
+  return `\n输出画幅必须严格使用 ${targetAspect} 的宽高比。整个构图需要按照这个比例来组织，确保视觉元素在画布上均衡分布。`
+}
+
+export function appendTargetAspectPrompt(prompt: string, targetAspect?: string): string {
+  if (!targetAspect) return prompt
+  return prompt + buildTargetAspectPrompt(targetAspect)
+}
+
 /** 图片裂变提示词（中文） */
 export function buildVariationPrompt(
   scene: VariationScene,
   strength: VariationStrength,
   variationIndex?: number,
   directionIndex?: number,
-  targetAspect?: string,
 ): string {
   const directionPrompt = buildVariationDirectionPrompt(strength, variationIndex, directionIndex)
   const looseSubject = strength === 'balanced' || strength === 'bold'
@@ -221,9 +230,6 @@ export function buildVariationPrompt(
 3. 只需要保留大类主体或大类场景，不需要保留原图的具体主题元素；猫咪可以换动作，沙滩可以换成任何能看出是沙滩的场景。
 4. 不要保留原图的具体构图、具体对象位置、具体物体数量、边缘轮廓、裁切方式或视觉焦点。`
       : ''
-  const aspectPrompt = targetAspect
-    ? `\n输出画幅必须严格使用 ${targetAspect} 的宽高比。整个构图需要按照这个比例来组织，确保视觉元素在画布上均衡分布。`
-    : ''
   return `【图片裂变 / 印花再设计】
 请把输入图片作为主题和风格参考，而不是复制对象。生成一张新的商业印花图案。
 
@@ -238,7 +244,7 @@ ${sceneRule}
 ${VARIATION_SCENE_PROMPTS[scene]}
 ${VARIATION_STRENGTH_PROMPTS[strength]}
 ${boldInstruction}
-${directionPrompt}${aspectPrompt}`
+${directionPrompt}`
 }
 
 export const STORAGE_KEY_TOKEN = 'batch_image_api_token'
