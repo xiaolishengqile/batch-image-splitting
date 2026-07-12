@@ -649,7 +649,13 @@ export default function App() {
             ? PROMPT_OUTPAINT_CN
             : jobType === 'extract'
               ? PROMPT_PATTERN_EXTRACT_CN
-              : buildVariationPrompt(variationScene, variationStrength, variationIndex, directionIndex),
+              : buildVariationPrompt(
+                  variationScene,
+                  variationStrength,
+                  variationIndex,
+                  directionIndex,
+                  resolutionMode === 'aspect' ? targetAspect : undefined,
+                ),
         size: sizeForRequest,
       }
     }
