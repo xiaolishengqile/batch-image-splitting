@@ -110,6 +110,16 @@ export async function writeBlobToDirectory(
 }
 
 /**
+ * 获取或创建子目录
+ */
+export async function getOrCreateSubdirectory(
+  parent: FileSystemDirectoryHandle,
+  name: string,
+): Promise<FileSystemDirectoryHandle> {
+  return parent.getDirectoryHandle(name, { create: true })
+}
+
+/**
  * 将 Data URL 写入指定目录
  */
 export async function writeImageToDirectory(

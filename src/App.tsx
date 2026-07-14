@@ -51,6 +51,9 @@ import {
   buildVariationPrompt,
   pickVariationDirectionIndices,
   TASK_RETRY_DELAY_MS,
+  TASK_TIMEOUT_MS,
+  TASK_TIMEOUT_MESSAGE,
+  UNSUCCESSFUL_SUBFOLDER_NAME,
   type ResolutionMode,
   type VariationScene,
   type VariationStrength,
@@ -59,6 +62,7 @@ import {
   supportsSaveToFolder,
   pickSaveDirectoryHandle,
   writeBlobToDirectory,
+  getOrCreateSubdirectory,
   extensionFromBlob,
   getImageFilesFromDataTransfer,
   isImageFile,
@@ -189,6 +193,53 @@ function readInitialCustomTargetAspect(targetAspect: string): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+class TaskTimeoutError extends Error {
+  constructor() {
+    super(TASK_TIMEOUT_MESSAGE)
+    this.name = 'TaskTimeoutError'
+  }
+}
+
+function isTaskTimeoutError(e: unknown): boolean {
+  return e instanceof TaskTimeoutError || (e instanceof Error && e.message === TASK_TIMEOUT_MESSAGE)
+}
+
+function jobTypeLabel(jobType: JobType): string {
+  if (jobType === 'outpaint') return '扩充'
+  if (jobType === 'variation') return '裂变'
+  if (jobType === 'extract') return '提取'
+  return '文生图'
+}
+
+async function downloadOriginalFile(file: File): Promise<void> {
+  const url = URL.createObjectURL(file)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = file.name
+  a.click()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+async function copyOriginalFileToClipboard(file: File): Promise<void> {
+  const type = file.type || 'image/png'
+  await navigator.clipboard.write([new ClipboardItem({ [type]: file })])
+}
+
+async function exportUnsuccessfulOriginals(
+  files: File[],
+  dirHandle: FileSystemDirectoryHandle,
+): Promise<number> {
+  if (files.length === 0) return 0
+  const subDir = await getOrCreateSubdirectory(dirHandle, UNSUCCESSFUL_SUBFOLDER_NAME)
+  const used = new Set<string>()
+  let saved = 0
+  for (const file of files) {
+    await writeBlobToDirectory(subDir, file, file.name, used)
+    saved += 1
+  }
+  return saved
 }
 
 const DIRECTORY_INPUT_PROPS: InputHTMLAttributes<HTMLInputElement> & { webkitdirectory: string } = {
@@ -669,12 +720,17 @@ export default function App() {
     const runOneTask = async (
       task: TaskItem,
       batchCtx: { activeControllers: Set<AbortController> },
+      deadline: number,
     ): Promise<{ imageDataUrl: string } | null> => {
       if (cancelRef.current) return null
+
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new TaskTimeoutError()
 
       const ac = new AbortController()
       batchCtx.activeControllers.add(ac)
       activeAbortControllersRef.current.add(ac)
+      const timeoutId = window.setTimeout(() => ac.abort(), remaining)
 
       try {
         let imageDataUrl: string
@@ -719,11 +775,14 @@ export default function App() {
 
         return { imageDataUrl }
       } catch (e) {
-        if (cancelRef.current || (e instanceof DOMException && e.name === 'AbortError')) {
+        if (cancelRef.current) return null
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          if (Date.now() >= deadline) throw new TaskTimeoutError()
           return null
         }
         throw e
       } finally {
+        window.clearTimeout(timeoutId)
         batchCtx.activeControllers.delete(ac)
         activeAbortControllersRef.current.delete(ac)
       }
@@ -734,26 +793,40 @@ export default function App() {
       batchCtx: { activeControllers: Set<AbortController> },
       jobId: string,
     ): Promise<{ imageDataUrl: string } | null> => {
+      const deadline = Date.now() + TASK_TIMEOUT_MS
       let lastError: unknown
+
       for (let attempt = 0; attempt <= DEFAULT_TASK_RETRY_COUNT; attempt++) {
         if (cancelRef.current) return null
+
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) throw new TaskTimeoutError()
+
         try {
-          return await runOneTask(task, batchCtx)
+          return await runOneTask(task, batchCtx, deadline)
         } catch (e) {
           lastError = e
-          if (cancelRef.current || (e instanceof DOMException && e.name === 'AbortError')) {
-            return null
-          }
+          if (cancelRef.current) return null
+          if (isTaskTimeoutError(e)) throw e
+
           if (attempt < DEFAULT_TASK_RETRY_COUNT) {
+            const waitMs = TASK_RETRY_DELAY_MS * (attempt + 1)
+            const waitRemaining = deadline - Date.now()
+            if (waitRemaining <= 0) throw new TaskTimeoutError()
+
             updateJob(jobId, {
               error: `第 ${attempt + 1} 次失败，正在重试...`,
             })
-            await delay(TASK_RETRY_DELAY_MS * (attempt + 1))
+            await delay(Math.min(waitMs, waitRemaining))
+            if (Date.now() >= deadline) throw new TaskTimeoutError()
           }
         }
       }
       throw lastError
     }
+
+    type TaskOutcome = 'pending' | 'done' | 'error'
+    const taskOutcomes: TaskOutcome[] = taskQueue.map(() => 'pending')
 
     let taskCursor = 0
 
@@ -793,8 +866,13 @@ export default function App() {
         }
         const jobSettled = new Set<string>()
 
-        const markJobFinished = (jobId: string, patch: Partial<Job>) => {
+        const markJobFinished = (taskIndex: number, jobId: string, patch: Partial<Job>) => {
           updateJob(jobId, patch)
+          if (patch.status === 'done') {
+            taskOutcomes[taskIndex] = 'done'
+          } else if (patch.status === 'error') {
+            taskOutcomes[taskIndex] = 'error'
+          }
           if (!jobSettled.has(jobId)) {
             jobSettled.add(jobId)
             setProcessedTaskCount((prev) => prev + 1)
@@ -808,6 +886,7 @@ export default function App() {
 
             const task = batchTasks[myTask]
             const jobId = batchJobs[myTask].id
+            const taskIndex = batchStart + myTask
 
             updateJob(jobId, { status: 'running' })
 
@@ -815,13 +894,13 @@ export default function App() {
               const result = await runOneTaskWithRetry(task, batchCtx, jobId)
               if (result) {
                 if (cancelRef.current) {
-                  markJobFinished(jobId, { status: 'error', error: CANCEL_MESSAGE })
+                  markJobFinished(taskIndex, jobId, { status: 'error', error: CANCEL_MESSAGE })
                   continue
                 }
                 try {
                   await putResultImage(jobId, result.imageDataUrl)
                 } catch {
-                  markJobFinished(jobId, { status: 'error', error: '结果保存失败' })
+                  markJobFinished(taskIndex, jobId, { status: 'error', error: '结果保存失败' })
                   continue
                 }
                 const finishedJob: Job = {
@@ -830,7 +909,7 @@ export default function App() {
                   hasResult: true,
                   completedAt: Date.now(),
                 }
-                markJobFinished(jobId, {
+                markJobFinished(taskIndex, jobId, {
                   status: 'done',
                   hasResult: true,
                   completedAt: finishedJob.completedAt,
@@ -841,18 +920,31 @@ export default function App() {
                   updateJob(jobId, { saveError })
                 }
               } else if (cancelRef.current) {
-                markJobFinished(jobId, { status: 'error', error: CANCEL_MESSAGE })
+                markJobFinished(taskIndex, jobId, { status: 'error', error: CANCEL_MESSAGE })
               } else {
-                markJobFinished(jobId, { status: 'error', error: '任务已中断' })
+                markJobFinished(taskIndex, jobId, { status: 'error', error: '任务已中断' })
               }
             } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e)
-              markJobFinished(jobId, { status: 'error', error: msg })
+              const msg = isTaskTimeoutError(e)
+                ? TASK_TIMEOUT_MESSAGE
+                : e instanceof Error
+                  ? e.message
+                  : String(e)
+              markJobFinished(taskIndex, jobId, { status: 'error', error: msg })
             }
           }
         }
 
         await Promise.all(Array.from({ length: concurrency }, () => worker()))
+
+        if (cancelRef.current) {
+          for (let i = 0; i < batchTasks.length; i++) {
+            const taskIndex = batchStart + i
+            if (taskOutcomes[taskIndex] === 'pending') {
+              markJobFinished(taskIndex, batchJobs[i].id, { status: 'error', error: CANCEL_MESSAGE })
+            }
+          }
+        }
 
         taskCursor = batchEnd
 
@@ -864,6 +956,59 @@ export default function App() {
       activeAbortControllersRef.current.clear()
       runInProgressRef.current = false
       setIsRunning(false)
+
+      const orphanFailedJobs: Job[] = []
+      for (let i = 0; i < totalTasks; i++) {
+        if (taskOutcomes[i] !== 'pending') continue
+        const task = taskQueue[i]
+        if (task.jobType === 'text2img' || !task.file) continue
+
+        orphanFailedJobs.push({
+          id: crypto.randomUUID(),
+          file: task.file,
+          previewObjectUrl: URL.createObjectURL(task.file),
+          status: 'error',
+          error: cancelRef.current ? CANCEL_MESSAGE : '未生成',
+          jobType: task.jobType,
+          fileIndex: task.fileIndex,
+          promptIndex: task.promptIndex,
+          variationIndex: task.variationIndex,
+          prompt: task.prompt,
+          outputName: task.outputName,
+          addedSeq: addedSeqRef.current++,
+        })
+        taskOutcomes[i] = 'error'
+      }
+
+      if (orphanFailedJobs.length > 0) {
+        setJobs((prev) => [...prev, ...orphanFailedJobs])
+        setProcessedTaskCount((prev) => prev + orphanFailedJobs.length)
+      }
+
+      const filesToExport: File[] = []
+      const seenFileIndex = new Set<number>()
+      for (let i = 0; i < totalTasks; i++) {
+        const task = taskQueue[i]
+        if (task.jobType === 'text2img' || !task.file || task.fileIndex == null) continue
+        if (taskOutcomes[i] !== 'done' && !seenFileIndex.has(task.fileIndex)) {
+          seenFileIndex.add(task.fileIndex)
+          filesToExport.push(task.file)
+        }
+      }
+
+      if (filesToExport.length > 0) {
+        const dir = saveFolderHandleRef.current
+        if (!dir) {
+          alert('请先选择文件夹，否则未生成原图无法落盘')
+        } else {
+          try {
+            await exportUnsuccessfulOriginals(filesToExport, dir)
+          } catch (e) {
+            alert(`保存未生成原图失败：${e instanceof Error ? e.message : String(e)}`)
+          }
+        }
+      }
+
       if (!cancelRef.current) {
         const next = String(nextStartNumberAfterRun)
         setStartNumberInput(next)
@@ -1014,7 +1159,9 @@ export default function App() {
       if (job.promptIndex != null) return 100_000 + job.promptIndex
       return 200_000 + job.addedSeq
     }
-    return [...jobs].sort((a, b) => {
+    return [...jobs]
+      .filter((job) => job.status !== 'error')
+      .sort((a, b) => {
       const sourceDiff = sourceRank(a) - sourceRank(b)
       if (sourceDiff !== 0) return sourceDiff
       const typeDiff = jobTypeRank[a.jobType] - jobTypeRank[b.jobType]
@@ -1024,6 +1171,54 @@ export default function App() {
       return a.addedSeq - b.addedSeq
     })
   }, [jobs])
+
+  const failedDisplayItems = useMemo(() => {
+    const map = new Map<
+      number,
+      { file: File; previewObjectUrl?: string; jobs: Job[]; errors: string[] }
+    >()
+
+    for (const job of jobs) {
+      if (job.status !== 'error' || job.jobType === 'text2img' || !job.file || job.fileIndex == null) {
+        continue
+      }
+      const existing = map.get(job.fileIndex)
+      if (existing) {
+        existing.jobs.push(job)
+        if (job.error && !existing.errors.includes(job.error)) {
+          existing.errors.push(job.error)
+        }
+      } else {
+        map.set(job.fileIndex, {
+          file: job.file,
+          previewObjectUrl: job.previewObjectUrl,
+          jobs: [job],
+          errors: job.error ? [job.error] : [],
+        })
+      }
+    }
+
+    return Array.from(map.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([fileIndex, item]) => ({
+        fileIndex,
+        file: item.file,
+        previewObjectUrl: item.previewObjectUrl,
+        jobs: item.jobs,
+        errors: item.errors,
+        jobTypes: [...new Set(item.jobs.map((j) => jobTypeLabel(j.jobType)))].join('、'),
+        outputNames: item.jobs.map((j) => j.outputName).filter(Boolean) as string[],
+      }))
+  }, [jobs])
+
+  const copyFailedOriginal = useCallback(async (file: File) => {
+    try {
+      await copyOriginalFileToClipboard(file)
+      alert('原图已复制到剪贴板')
+    } catch (e) {
+      alert(`复制失败：${e instanceof Error ? e.message : String(e)}`)
+    }
+  }, [])
 
   const canStart = Boolean(
     apiToken.trim() &&
@@ -1612,7 +1807,7 @@ export default function App() {
             <h3>🚀 开始处理</h3>
 
             <p className="batch-hint">
-              每批最多 {BATCH_WINDOW_SIZE} 个任务；失败任务会自动重试 {DEFAULT_TASK_RETRY_COUNT} 次。
+              每批最多 {BATCH_WINDOW_SIZE} 个任务；单任务累计超过 10 分钟将自动跳过；失败任务会自动重试 {DEFAULT_TASK_RETRY_COUNT} 次。
             </p>
             {enabledFeatureCount > 1 ? (
               <p className="task-order-hint">
@@ -1721,20 +1916,88 @@ export default function App() {
                 {totalBatchCount > 1 ? ` · 共 ${totalBatchCount} 批` : ''}
               </p>
             ) : null}
-            {!isRunning && jobs.length > 0 ? (
+            {!isRunning && (displayJobs.length > 0 || failedDisplayItems.length > 0) ? (
               <p className="results-summary">
-                结果汇总：共 {jobs.length} 项 · 成功 {jobStats.done} · 失败 {jobStats.error}
+                结果汇总：成功 {jobStats.done}
+                {failedDisplayItems.length > 0 ? ` · 失败原图 ${failedDisplayItems.length}` : ''}
               </p>
             ) : null}
           </div>
 
+          {/* 失败 / 超时 */}
+          {failedDisplayItems.length > 0 && (
+            <div className="failed-section">
+              <div className="failed-header">
+                <h2 className="failed-heading">生成失败</h2>
+                <span className="failed-summary">
+                  共 {failedDisplayItems.length} 张原图未成功（已按原图去重）
+                </span>
+              </div>
+              <p className="failed-hint">
+                以下原图生成失败或未完成。可复制或下载后手动重试；若已选择保存文件夹，原图也会写入「{UNSUCCESSFUL_SUBFOLDER_NAME}」子文件夹。
+              </p>
+              <div className="failed-grid">
+                {failedDisplayItems.map((item) => (
+                  <article key={item.fileIndex} className="failed-card">
+                    <figure className="failed-thumb">
+                      {item.previewObjectUrl ? (
+                        <img src={item.previewObjectUrl} alt={item.file.name} />
+                      ) : (
+                        <span className="failed-thumb-placeholder">原图</span>
+                      )}
+                    </figure>
+                    <div className="failed-card-body">
+                      <div className="failed-card-head">
+                        <span className="failed-name" title={item.file.name}>
+                          {truncateLabel(item.file.name, 28)}
+                        </span>
+                        <span className="failed-type">{item.jobTypes}</span>
+                      </div>
+                      {item.outputNames.length > 0 ? (
+                        <div className="failed-outputs" title={item.outputNames.join('、')}>
+                          输出：{truncateLabel(item.outputNames.join('、'), 36)}
+                        </div>
+                      ) : null}
+                      {item.errors.length > 0 ? (
+                        <div className="failed-errors">
+                          {item.errors.map((err) => (
+                            <div key={err} className="failed-error-line">
+                              {err}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="failed-actions">
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          onClick={() => void downloadOriginalFile(item.file)}
+                        >
+                          下载原图
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-ghost"
+                          onClick={() => void copyFailedOriginal(item.file)}
+                        >
+                          复制原图
+                        </button>
+                      </div>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* 生成结果 */}
-          {jobs.length > 0 && (
+          {displayJobs.length > 0 && (
             <div className="results-section">
               <div className="results-header">
                 <h2 className="results-heading">生成结果</h2>
                 <span className="results-summary">
-                  成功 {jobStats.done} · 失败 {jobStats.error}
+                  成功 {jobStats.done}
+                  {jobStats.running > 0 ? ` · 进行中 ${jobStats.running}` : ''}
                 </span>
                 <button
                   type="button"

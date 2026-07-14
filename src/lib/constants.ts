@@ -26,6 +26,13 @@ export const CANCEL_MESSAGE = '已取消'
 export const DEFAULT_TASK_RETRY_COUNT = 2
 export const TASK_RETRY_DELAY_MS = 1500
 
+/** 单任务累计超时（含重试与重试间隔），超过后跳过 */
+export const TASK_TIMEOUT_MS = 10 * 60 * 1000
+export const TASK_TIMEOUT_MESSAGE = '超时（累计超过 10 分钟）'
+
+/** 未成功生成时，原图保存到所选文件夹下的子目录名 */
+export const UNSUCCESSFUL_SUBFOLDER_NAME = '未生成成功'
+
 export const DEFAULT_MODEL = 'gpt-image-2'
 
 /** 图片扩充提示词 */
